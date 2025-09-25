@@ -1,4 +1,4 @@
-From 5bfb99d7637c17e7ae594af6da89ad196a2aa76d Mon Sep 17 00:00:00 2001
+From f5fc4ce793c09e8a0fe98cb9c6be4008c2d85583 Mon Sep 17 00:00:00 2001
 From: Tux <write@imaginarycode.com>
 Date: Thu, 19 May 2016 19:33:31 +0200
 Subject: [PATCH] POM Changes
@@ -593,7 +593,7 @@ index 8beec32c..023ce639 100644
          <license>
              <name>BSD-3-Clause</name>
 diff --git a/pom.xml b/pom.xml
-index 548700d2..5b9b8c1f 100644
+index 548700d2..13fa2257 100644
 --- a/pom.xml
 +++ b/pom.xml
 @@ -3,18 +3,18 @@
@@ -677,11 +677,11 @@ index 548700d2..5b9b8c1f 100644
 -            <id>ossrh-staging-api</id>
 -            <url>https://ossrh-staging-api.central.sonatype.com/service/local/staging/deploy/maven2/</url>
 +            <id>papermc-releases</id>
-+            <url>https://repo.papermc.io/repository/maven-releases/</url>
++            <url>https://artifactory.papermc.io/artifactory/releases/</url>
          </repository>
 +        <snapshotRepository>
 +            <id>papermc-snapshots</id>
-+            <url>https://repo.papermc.io/repository/maven-snapshots/</url>
++            <url>https://artifactory.papermc.io/artifactory/snapshots/</url>
 +        </snapshotRepository>
      </distributionManagement>
  
