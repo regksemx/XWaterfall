@@ -1,4 +1,4 @@
-From c9890ffde85d8587a07311f947ca35ae0e40dfe4 Mon Sep 17 00:00:00 2001
+From 8b77ab137acd5f83184f29ffaf313a39aa5a02f9 Mon Sep 17 00:00:00 2001
 From: Janmm14 <gitconfig1@janmm14.de>
 Date: Mon, 21 Jun 2021 23:43:39 +0200
 Subject: [PATCH] Replace reflection inside netty with ChannelFactory.
@@ -6,10 +6,10 @@ Subject: [PATCH] Replace reflection inside netty with ChannelFactory.
 Thanks for pointing it out @MrIvanPlays
 
 diff --git a/proxy/src/main/java/net/md_5/bungee/BungeeCord.java b/proxy/src/main/java/net/md_5/bungee/BungeeCord.java
-index c097f58a..c30c2746 100644
+index 524ede4c..03677b9d 100644
 --- a/proxy/src/main/java/net/md_5/bungee/BungeeCord.java
 +++ b/proxy/src/main/java/net/md_5/bungee/BungeeCord.java
-@@ -363,7 +363,7 @@ public class BungeeCord extends ProxyServer
+@@ -364,7 +364,7 @@ public class BungeeCord extends ProxyServer
                  }
              };
              new ServerBootstrap()
@@ -32,7 +32,7 @@ index 0d24f1eb..0ce7b343 100644
                  .handler( ProxyServer.getInstance().unsafe().getServerInfoChannelInitializer().getChannelInitializer() )
                  .option( ChannelOption.CONNECT_TIMEOUT_MILLIS, BungeeCord.getInstance().getConfig().getRemotePingTimeout() )
 diff --git a/proxy/src/main/java/net/md_5/bungee/UserConnection.java b/proxy/src/main/java/net/md_5/bungee/UserConnection.java
-index d235aca5..e3ecb51b 100644
+index 733738c1..e2361011 100644
 --- a/proxy/src/main/java/net/md_5/bungee/UserConnection.java
 +++ b/proxy/src/main/java/net/md_5/bungee/UserConnection.java
 @@ -450,7 +450,7 @@ public final class UserConnection implements ProxiedPlayer
