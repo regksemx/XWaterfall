@@ -743,7 +743,7 @@ index e489b6eb..a11d5b50 100644
                  <groupId>org.apache.maven.plugins</groupId>
                  <artifactId>maven-checkstyle-plugin</artifactId>
                  <version>3.6.0</version>
-@@ -194,6 +220,7 @@
+@@ -233,6 +259,7 @@
                      </dependency>
                  </dependencies>
              </plugin>
