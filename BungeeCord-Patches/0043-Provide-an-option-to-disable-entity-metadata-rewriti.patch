@@ -128,7 +128,7 @@ index 617edba6..27e2d27a 100644
 +    // Waterfall end
  }
 diff --git a/proxy/src/main/java/net/md_5/bungee/connection/DownstreamBridge.java b/proxy/src/main/java/net/md_5/bungee/connection/DownstreamBridge.java
-index 58b98e0c..80dd6a31 100644
+index 36c80111..db8ecbe4 100644
 --- a/proxy/src/main/java/net/md_5/bungee/connection/DownstreamBridge.java
 +++ b/proxy/src/main/java/net/md_5/bungee/connection/DownstreamBridge.java
 @@ -769,6 +769,7 @@ public class DownstreamBridge extends PacketHandler
