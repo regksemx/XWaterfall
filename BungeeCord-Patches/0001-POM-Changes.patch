@@ -994,7 +994,7 @@ index d515972c..58048e8c 100644
              <scope>compile</scope>
          </dependency>
 diff --git a/slf4j/pom.xml b/slf4j/pom.xml
-index 3020e103..4181e784 100644
+index 73aa291e..30efeb47 100644
 --- a/slf4j/pom.xml
 +++ b/slf4j/pom.xml
 @@ -4,19 +4,19 @@
