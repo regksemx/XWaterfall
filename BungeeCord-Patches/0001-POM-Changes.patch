@@ -817,7 +817,7 @@ index bf46a988..51c8e3a3 100644
              <scope>compile</scope>
          </dependency>
 diff --git a/proxy/pom.xml b/proxy/pom.xml
-index ce6400d7..b1580529 100644
+index b8cce095..0b910017 100644
 --- a/proxy/pom.xml
 +++ b/proxy/pom.xml
 @@ -4,18 +4,18 @@
