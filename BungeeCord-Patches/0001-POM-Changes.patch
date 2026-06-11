@@ -720,7 +720,7 @@ index e489b6eb..a11d5b50 100644
      </distributionManagement>
  
      <properties>
-@@ -155,6 +172,7 @@
+@@ -194,6 +211,7 @@
                      </execution>
                  </executions>
              </plugin>
