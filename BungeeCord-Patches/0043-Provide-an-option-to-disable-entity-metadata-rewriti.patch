@@ -57,7 +57,7 @@ index 4ff8da6d..e860214f 100644
 +    }
  }
 diff --git a/proxy/src/main/java/net/md_5/bungee/ServerConnector.java b/proxy/src/main/java/net/md_5/bungee/ServerConnector.java
-index 0c4f067c..81602d23 100644
+index 0340226e..aed2ddc1 100644
 --- a/proxy/src/main/java/net/md_5/bungee/ServerConnector.java
 +++ b/proxy/src/main/java/net/md_5/bungee/ServerConnector.java
 @@ -335,6 +335,7 @@ public class ServerConnector extends PacketHandler
