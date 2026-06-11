@@ -253,7 +253,7 @@ index a11d5b50..03246559 100644
          <module>nbt</module>
      </modules>
 @@ -96,6 +97,7 @@
-         <lombok.version>1.18.44</lombok.version>
+         <lombok.version>1.18.46</lombok.version>
          <maven.compiler.release>17</maven.compiler.release>
          <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 +        <log4j2.version>2.25.3</log4j2.version>
