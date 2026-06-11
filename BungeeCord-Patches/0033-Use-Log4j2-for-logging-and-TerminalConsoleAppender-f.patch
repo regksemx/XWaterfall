@@ -231,7 +231,7 @@ index 00000000..cfd039cd
 +    </Loggers>
 +</Configuration>
 diff --git a/pom.xml b/pom.xml
-index e956060c..3fcc531a 100644
+index a11d5b50..03246559 100644
 --- a/pom.xml
 +++ b/pom.xml
 @@ -58,14 +58,15 @@
