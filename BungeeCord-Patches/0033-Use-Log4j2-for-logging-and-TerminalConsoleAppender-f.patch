@@ -260,7 +260,7 @@ index a11d5b50..03246559 100644
      </properties>
  
      <!-- We really shouldn't depend on external repositories -->
-@@ -184,6 +186,13 @@
+@@ -223,6 +225,13 @@
                              <artifactId>lombok</artifactId>
                              <version>${lombok.version}</version>
                          </annotationProcessorPath>
