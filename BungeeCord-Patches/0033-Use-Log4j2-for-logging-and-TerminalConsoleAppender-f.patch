@@ -274,7 +274,7 @@ index a11d5b50..03246559 100644
                      </annotationProcessorPaths>
                  </configuration>
              </plugin>
-@@ -248,6 +257,11 @@
+@@ -288,6 +297,11 @@
                                      <ignoreClasses>
                                          <ignoreClass>org.jline.terminal.impl.ffm.*</ignoreClass>
                                      </ignoreClasses>
