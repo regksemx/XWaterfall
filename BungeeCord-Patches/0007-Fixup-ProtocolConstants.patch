@@ -5,7 +5,7 @@ Subject: [PATCH] Fixup ProtocolConstants
 
 
 diff --git a/protocol/src/main/java/net/md_5/bungee/protocol/ProtocolConstants.java b/protocol/src/main/java/net/md_5/bungee/protocol/ProtocolConstants.java
-index fd0cfd3a..80da91a8 100644
+index 78dda06d..aa91234a 100644
 --- a/protocol/src/main/java/net/md_5/bungee/protocol/ProtocolConstants.java
 +++ b/protocol/src/main/java/net/md_5/bungee/protocol/ProtocolConstants.java
 @@ -138,6 +138,16 @@ public class ProtocolConstants
