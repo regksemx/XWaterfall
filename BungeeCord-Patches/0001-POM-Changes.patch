@@ -728,7 +728,7 @@ index e489b6eb..a11d5b50 100644
              <plugin>
                  <groupId>org.apache.maven.plugins</groupId>
                  <artifactId>maven-compiler-plugin</artifactId>
-@@ -170,6 +188,14 @@
+@@ -209,6 +227,14 @@
                  </configuration>
              </plugin>
              <plugin>
