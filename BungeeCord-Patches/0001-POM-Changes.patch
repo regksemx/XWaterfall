@@ -621,7 +621,7 @@ index afb805d1..be74fd49 100644
          <license>
              <name>BSD-3-Clause</name>
 diff --git a/pom.xml b/pom.xml
-index 18bbe6f9..e956060c 100644
+index e489b6eb..a11d5b50 100644
 --- a/pom.xml
 +++ b/pom.xml
 @@ -3,18 +3,24 @@
