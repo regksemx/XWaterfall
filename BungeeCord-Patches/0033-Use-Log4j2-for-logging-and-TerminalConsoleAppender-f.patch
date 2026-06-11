@@ -287,7 +287,7 @@ index a11d5b50..03246559 100644
                              </rules>
                          </configuration>
 diff --git a/proxy/pom.xml b/proxy/pom.xml
-index 8c25ae3a..cec44945 100644
+index 453e269b..0b4ca23a 100644
 --- a/proxy/pom.xml
 +++ b/proxy/pom.xml
 @@ -45,6 +45,7 @@
