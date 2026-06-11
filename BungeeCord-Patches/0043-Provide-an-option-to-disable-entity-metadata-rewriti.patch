@@ -1,4 +1,4 @@
-From ab8aafb9fef9aaf34000faa327d75b72156a376e Mon Sep 17 00:00:00 2001
+From c3bcfa9c0681c402c5ad511b6ce66413bf9bbb28 Mon Sep 17 00:00:00 2001
 From: Shane Freeder <theboyetronic@gmail.com>
 Date: Mon, 14 Jan 2019 03:35:21 +0000
 Subject: [PATCH] Provide an option to disable entity metadata rewriting
