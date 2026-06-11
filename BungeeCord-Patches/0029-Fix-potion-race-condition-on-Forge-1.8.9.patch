@@ -142,7 +142,7 @@ index 1d0553f8..617edba6 100644
      @Setter
      private String lastCommandTabbed;
 diff --git a/proxy/src/main/java/net/md_5/bungee/connection/DownstreamBridge.java b/proxy/src/main/java/net/md_5/bungee/connection/DownstreamBridge.java
-index 99c6b422..58b98e0c 100644
+index 06db0f79..36c80111 100644
 --- a/proxy/src/main/java/net/md_5/bungee/connection/DownstreamBridge.java
 +++ b/proxy/src/main/java/net/md_5/bungee/connection/DownstreamBridge.java
 @@ -765,6 +765,32 @@ public class DownstreamBridge extends PacketHandler
