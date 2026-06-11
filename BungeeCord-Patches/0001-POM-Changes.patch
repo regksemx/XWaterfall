@@ -327,7 +327,7 @@ index 87e87634..2bd289ee 100644
              <scope>compile</scope>
          </dependency>
 diff --git a/maven-resolver/pom.xml b/maven-resolver/pom.xml
-index 433cb0e0..abdd8bab 100644
+index 01ae76f5..c33746f1 100644
 --- a/maven-resolver/pom.xml
 +++ b/maven-resolver/pom.xml
 @@ -4,14 +4,14 @@
