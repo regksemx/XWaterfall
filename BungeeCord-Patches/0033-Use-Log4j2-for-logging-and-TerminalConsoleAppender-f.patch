@@ -1,4 +1,4 @@
-From 51fb14c57c07e9fdbbc95907f84d9b04dd00e304 Mon Sep 17 00:00:00 2001
+From fe1b1f4a3466da9294094a5cc47f94e8f84a7898 Mon Sep 17 00:00:00 2001
 From: Minecrell <minecrell@minecrell.net>
 Date: Fri, 22 Sep 2017 12:46:47 +0200
 Subject: [PATCH] Use Log4j2 for logging and TerminalConsoleAppender for
