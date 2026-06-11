@@ -286,7 +286,7 @@ index 11ca800f..f15f7406 100644
 +    <description>Generic java event dispatching API intended for use with Waterfall.</description>
  </project>
 diff --git a/log/pom.xml b/log/pom.xml
-index cd62b78d..b538b00f 100644
+index 87e87634..2bd289ee 100644
 --- a/log/pom.xml
 +++ b/log/pom.xml
 @@ -4,19 +4,19 @@
