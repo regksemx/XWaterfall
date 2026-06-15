@@ -1,4 +1,4 @@
-From 8b77ab137acd5f83184f29ffaf313a39aa5a02f9 Mon Sep 17 00:00:00 2001
+From a0311cc041cc5ef627337e24febd98d94e823e22 Mon Sep 17 00:00:00 2001
 From: Janmm14 <gitconfig1@janmm14.de>
 Date: Mon, 21 Jun 2021 23:43:39 +0200
 Subject: [PATCH] Replace reflection inside netty with ChannelFactory.
@@ -32,10 +32,10 @@ index 0d24f1eb..0ce7b343 100644
                  .handler( ProxyServer.getInstance().unsafe().getServerInfoChannelInitializer().getChannelInitializer() )
                  .option( ChannelOption.CONNECT_TIMEOUT_MILLIS, BungeeCord.getInstance().getConfig().getRemotePingTimeout() )
 diff --git a/proxy/src/main/java/net/md_5/bungee/UserConnection.java b/proxy/src/main/java/net/md_5/bungee/UserConnection.java
-index 733738c1..e2361011 100644
+index 021988a1..dbd50a8a 100644
 --- a/proxy/src/main/java/net/md_5/bungee/UserConnection.java
 +++ b/proxy/src/main/java/net/md_5/bungee/UserConnection.java
-@@ -450,7 +450,7 @@ public final class UserConnection implements ProxiedPlayer
+@@ -452,7 +452,7 @@ public final class UserConnection implements ProxiedPlayer
              }
          };
          Bootstrap b = new Bootstrap()
@@ -69,7 +69,7 @@ index 9756589e..d3881a3c 100644
      }
      // Waterfall End
 diff --git a/proxy/src/main/java/net/md_5/bungee/netty/PipelineUtils.java b/proxy/src/main/java/net/md_5/bungee/netty/PipelineUtils.java
-index e79500f3..cb216a8c 100644
+index 2f27b7d7..937c0028 100644
 --- a/proxy/src/main/java/net/md_5/bungee/netty/PipelineUtils.java
 +++ b/proxy/src/main/java/net/md_5/bungee/netty/PipelineUtils.java
 @@ -3,6 +3,8 @@ package net.md_5.bungee.netty;
@@ -143,5 +143,5 @@ index e79500f3..cb216a8c 100644
      {
          return io_uring ? IoUringDatagramChannel.class : epoll ? EpollDatagramChannel.class : NioDatagramChannel.class;
 -- 
-2.51.0
+2.54.0
 
