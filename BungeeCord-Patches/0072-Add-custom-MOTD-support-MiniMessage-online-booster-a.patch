@@ -1,0 +1,526 @@
+From 7c1f009de18be6d66da923be63001749ecabbb2b Mon Sep 17 00:00:00 2001
+From: regksem <regksem@tuta.io>
+Date: Fri, 19 Jun 2026 18:54:39 +0300
+Subject: [PATCH] Add custom MOTD support (MiniMessage, online booster, attack
+ favicon hiding)
+
+New motd section in xwaterfall.yml backed by Adventure/MiniMessage:
+
+- protocol-version: -1 echoes the client's own protocol (never 'outdated').
+- custom.motd: MiniMessage template (legacy & / section + hex auto-detected),
+  with {NL}, {PLAYER_ONLINE} and {PLAYER_ONLINE_MAX} placeholders.
+- custom.max-players: player count shown in the ping.
+- online-multiplier: round(real online * multiplier).
+- favicon-path / favicon-compression-level: configurable, re-encoded favicon.
+- hide-favicon-on-attack + attack-pings-per-second: drop the favicon under a
+  ping flood (AttackTracker) to save traffic.
+
+diff --git a/pom.xml b/pom.xml
+index 03246559..81df4e08 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -118,6 +118,12 @@
+                 <type>pom</type>
+                 <scope>import</scope>
+             </dependency>
++            <!-- XWaterfall - converge the annotations version pulled transitively by Adventure -->
++            <dependency>
++                <groupId>org.jetbrains</groupId>
++                <artifactId>annotations</artifactId>
++                <version>24.1.0</version>
++            </dependency>
+         </dependencies>
+     </dependencyManagement>
+     <dependencies>
+diff --git a/proxy/pom.xml b/proxy/pom.xml
+index 0b4ca23a..10215902 100644
+--- a/proxy/pom.xml
++++ b/proxy/pom.xml
+@@ -120,6 +120,60 @@
+             <version>5.0.4</version>
+             <scope>compile</scope>
+         </dependency>
++        <!-- XWaterfall start - Adventure / MiniMessage for custom MOTD -->
++        <dependency>
++            <groupId>net.kyori</groupId>
++            <artifactId>adventure-api</artifactId>
++            <version>4.17.0</version>
++            <scope>compile</scope>
++        </dependency>
++        <dependency>
++            <groupId>net.kyori</groupId>
++            <artifactId>adventure-text-minimessage</artifactId>
++            <version>4.17.0</version>
++            <scope>compile</scope>
++        </dependency>
++        <dependency>
++            <groupId>net.kyori</groupId>
++            <artifactId>adventure-text-serializer-gson</artifactId>
++            <version>4.17.0</version>
++            <scope>compile</scope>
++            <exclusions>
++                <!-- Use the gson already bundled by the proxy -->
++                <exclusion>
++                    <groupId>com.google.code.gson</groupId>
++                    <artifactId>gson</artifactId>
++                </exclusion>
++            </exclusions>
++        </dependency>
++        <dependency>
++            <groupId>net.kyori</groupId>
++            <artifactId>adventure-text-serializer-legacy</artifactId>
++            <version>4.17.0</version>
++            <scope>compile</scope>
++        </dependency>
++        <dependency>
++            <groupId>net.kyori</groupId>
++            <artifactId>adventure-text-serializer-bungeecord</artifactId>
++            <version>4.3.4</version>
++            <scope>compile</scope>
++            <exclusions>
++                <!-- Converge on the 4.17.0 Adventure modules declared above -->
++                <exclusion>
++                    <groupId>net.kyori</groupId>
++                    <artifactId>adventure-api</artifactId>
++                </exclusion>
++                <exclusion>
++                    <groupId>net.kyori</groupId>
++                    <artifactId>adventure-text-serializer-gson</artifactId>
++                </exclusion>
++                <exclusion>
++                    <groupId>net.kyori</groupId>
++                    <artifactId>adventure-text-serializer-legacy</artifactId>
++                </exclusion>
++            </exclusions>
++        </dependency>
++        <!-- XWaterfall end -->
+         <dependency>
+             <groupId>com.mysql</groupId>
+             <artifactId>mysql-connector-j</artifactId>
+diff --git a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
+index 4a059257..92a91fcd 100644
+--- a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
++++ b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
+@@ -1,6 +1,9 @@
+ package io.github.waterfallmc.waterfall.conf;
+ 
+ import com.google.common.base.Joiner;
++import io.github.waterfallmc.waterfall.motd.AttackTracker;
++import io.github.waterfallmc.waterfall.motd.MotdManager;
++import net.md_5.bungee.api.Favicon;
+ import net.md_5.bungee.api.ProxyServer;
+ import net.md_5.bungee.conf.Configuration;
+ import net.md_5.bungee.conf.ForwardingMode;
+@@ -89,6 +92,28 @@ public class WaterfallConfiguration extends Configuration {
+         if (isIpForward() && forwardingMode != ForwardingMode.BUNGEECORD_LEGACY && (forwardingSecret == null || forwardingSecret.isEmpty())) {
+             ProxyServer.getInstance().getLogger().log(Level.WARNING, "forwarding_mode is set to {0} but forwarding_secret is empty; backend servers will reject connections", forwardingMode);
+         }
++
++        // MOTD / server list ping
++        motdProtocolVersion = xConfig.getInt("motd.protocol-version", motdProtocolVersion);
++        hideFaviconOnAttack = xConfig.getBoolean("motd.hide-favicon-on-attack", hideFaviconOnAttack);
++        onlineMultiplier = xConfig.getDouble("motd.online-multiplier", onlineMultiplier);
++        customMotd = xConfig.getString("motd.custom.motd", customMotd);
++        motdMaxPlayers = xConfig.getInt("motd.custom.max-players", motdMaxPlayers);
++        AttackTracker.setThreshold(xConfig.getInt("motd.attack-pings-per-second", 60));
++        this.motdFavicon = MotdManager.loadFavicon(
++                xConfig.getString("motd.favicon-path", "server-icon.png"),
++                xConfig.getDouble("motd.favicon-compression-level", 0.0D));
++    }
++
++    /**
++     * Favicon loaded from the configured xwaterfall.yml path (with optional
++     * compression), overriding the default server-icon.png handling.
++     */
++    private Favicon motdFavicon;
++
++    @Override
++    public Favicon getFaviconObject() {
++        return motdFavicon;
+     }
+ 
+     @Override
+diff --git a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/XWaterfallConfig.java b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/XWaterfallConfig.java
+index 30c9b356..35e7e936 100644
+--- a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/XWaterfallConfig.java
++++ b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/XWaterfallConfig.java
+@@ -107,4 +107,10 @@ public class XWaterfallConfig
+         Object val = get( path );
+         return ( val instanceof Number ) ? ( (Number) val ).intValue() : def;
+     }
++
++    public double getDouble(String path, double def)
++    {
++        Object val = get( path );
++        return ( val instanceof Number ) ? ( (Number) val ).doubleValue() : def;
++    }
+ }
+diff --git a/proxy/src/main/java/io/github/waterfallmc/waterfall/motd/AttackTracker.java b/proxy/src/main/java/io/github/waterfallmc/waterfall/motd/AttackTracker.java
+new file mode 100644
+index 00000000..911693c1
+--- /dev/null
++++ b/proxy/src/main/java/io/github/waterfallmc/waterfall/motd/AttackTracker.java
+@@ -0,0 +1,57 @@
++package io.github.waterfallmc.waterfall.motd;
++
++import java.util.concurrent.atomic.AtomicInteger;
++
++/**
++ * Lightweight global server-list-ping rate tracker used to decide whether the
++ * proxy is currently being hit by a ping flood. A ping attack typically comes
++ * from many different addresses, so this counts pings globally rather than
++ * per-IP (which is what {@link net.md_5.bungee.ConnectionThrottle} does).
++ */
++public final class AttackTracker
++{
++
++    private AttackTracker()
++    {
++    }
++
++    private static volatile long currentSecond;
++    private static final AtomicInteger currentCount = new AtomicInteger();
++    private static volatile int lastSecondCount;
++    // Disabled by default until a threshold is configured.
++    private static volatile int threshold = -1;
++
++    public static void setThreshold(int pingsPerSecond)
++    {
++        threshold = ( pingsPerSecond <= 0 ) ? -1 : pingsPerSecond;
++    }
++
++    /**
++     * Records a single server list ping. Cheap and thread-safe.
++     */
++    public static void recordPing()
++    {
++        long second = System.currentTimeMillis() / 1000L;
++        if ( second != currentSecond )
++        {
++            currentSecond = second;
++            lastSecondCount = currentCount.getAndSet( 0 );
++        }
++        currentCount.incrementAndGet();
++    }
++
++    /**
++     * @return true if the ping rate in the current or the previous second has
++     * reached the configured threshold.
++     */
++    public static boolean isUnderAttack()
++    {
++        if ( threshold < 0 )
++        {
++            return false;
++        }
++        long second = System.currentTimeMillis() / 1000L;
++        int previous = ( second - currentSecond <= 1 ) ? lastSecondCount : 0;
++        return currentCount.get() >= threshold || previous >= threshold;
++    }
++}
+diff --git a/proxy/src/main/java/io/github/waterfallmc/waterfall/motd/MotdManager.java b/proxy/src/main/java/io/github/waterfallmc/waterfall/motd/MotdManager.java
+new file mode 100644
+index 00000000..cc70d4bd
+--- /dev/null
++++ b/proxy/src/main/java/io/github/waterfallmc/waterfall/motd/MotdManager.java
+@@ -0,0 +1,152 @@
++package io.github.waterfallmc.waterfall.motd;
++
++import java.awt.image.BufferedImage;
++import java.io.ByteArrayOutputStream;
++import java.io.File;
++import java.io.IOException;
++import java.util.Base64;
++import java.util.Iterator;
++import java.util.logging.Level;
++import javax.imageio.IIOImage;
++import javax.imageio.ImageIO;
++import javax.imageio.ImageWriteParam;
++import javax.imageio.ImageWriter;
++import javax.imageio.stream.ImageOutputStream;
++import net.kyori.adventure.text.Component;
++import net.kyori.adventure.text.minimessage.MiniMessage;
++import net.kyori.adventure.text.serializer.bungeecord.BungeeComponentSerializer;
++import net.md_5.bungee.api.Favicon;
++import net.md_5.bungee.api.ProxyServer;
++import net.md_5.bungee.api.chat.BaseComponent;
++import net.md_5.bungee.api.chat.TextComponent;
++import net.md_5.bungee.api.ChatColor;
++
++/**
++ * Renders the custom MOTD template and loads/compresses the ping favicon.
++ *
++ * <p>The template may use MiniMessage (RGB colors, gradients, ...) or legacy
++ * '&amp;' / section color codes including hex. The format is auto-detected: if
++ * the (placeholder-expanded) text contains legacy color codes it is parsed with
++ * the BungeeCord legacy parser, otherwise it is treated as MiniMessage.
++ */
++public final class MotdManager
++{
++
++    private MotdManager()
++    {
++    }
++
++    private static final String LEGACY_CODE_CHARS = "0123456789abcdefklmnorx";
++
++    /**
++     * Renders a MOTD template into a chat component.
++     *
++     * @param template the configured template
++     * @param online   the (already boosted) online count for {PLAYER_ONLINE}
++     * @param max       the max player count for {PLAYER_ONLINE_MAX}
++     * @return a chat component, never null
++     */
++    public static BaseComponent render(String template, int online, int max)
++    {
++        String text = template
++                .replace( "{PLAYER_ONLINE_MAX}", Integer.toString( max ) )
++                .replace( "{PLAYER_ONLINE}", Integer.toString( online ) )
++                .replace( "{NL}", "\n" );
++
++        try
++        {
++            if ( isLegacy( text ) )
++            {
++                return TextComponent.fromLegacy( ChatColor.translateAlternateColorCodes( '&', text ) );
++            }
++            Component component = MiniMessage.miniMessage().deserialize( text );
++            return new TextComponent( BungeeComponentSerializer.get().serialize( component ) );
++        } catch ( RuntimeException ex )
++        {
++            ProxyServer.getInstance().getLogger().log( Level.WARNING, "Could not parse custom MOTD, using it as plain text", ex );
++            return TextComponent.fromLegacy( text );
++        }
++    }
++
++    private static boolean isLegacy(String s)
++    {
++        if ( s.indexOf( ChatColor.COLOR_CHAR ) >= 0 )
++        {
++            return true;
++        }
++        for ( int i = 0; i + 1 < s.length(); i++ )
++        {
++            if ( s.charAt( i ) == '&' && LEGACY_CODE_CHARS.indexOf( Character.toLowerCase( s.charAt( i + 1 ) ) ) >= 0 )
++            {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    /**
++     * Loads the favicon from the given path, optionally re-encoding it with a
++     * custom PNG compression level.
++     *
++     * @param path             path to a 64x64 PNG, or empty/null to disable
++     * @param compressionLevel 0.0..1.0 (closer to 0 = stronger), or -1 to keep
++     *                         the default encoding
++     * @return the favicon, or null when disabled or unreadable
++     */
++    public static Favicon loadFavicon(String path, double compressionLevel)
++    {
++        if ( path == null || path.isEmpty() )
++        {
++            return null;
++        }
++        File file = new File( path );
++        if ( !file.exists() )
++        {
++            return null;
++        }
++        try
++        {
++            BufferedImage image = ImageIO.read( file );
++            if ( image == null )
++            {
++                return null;
++            }
++            if ( image.getWidth() != 64 || image.getHeight() != 64 )
++            {
++                ProxyServer.getInstance().getLogger().log( Level.WARNING, "Server icon {0} must be exactly 64x64 pixels", path );
++                return null;
++            }
++            if ( compressionLevel < 0 )
++            {
++                return Favicon.create( image );
++            }
++            return Favicon.create( encode( image, compressionLevel ) );
++        } catch ( IOException | IllegalArgumentException ex )
++        {
++            ProxyServer.getInstance().getLogger().log( Level.WARNING, "Could not load server icon " + path, ex );
++            return null;
++        }
++    }
++
++    private static String encode(BufferedImage image, double compressionLevel) throws IOException
++    {
++        Iterator<ImageWriter> writers = ImageIO.getImageWritersByFormatName( "png" );
++        ImageWriter writer = writers.next();
++        ByteArrayOutputStream stream = new ByteArrayOutputStream();
++        try ( ImageOutputStream ios = ImageIO.createImageOutputStream( stream ) )
++        {
++            writer.setOutput( ios );
++            ImageWriteParam param = writer.getDefaultWriteParam();
++            if ( param.canWriteCompressed() )
++            {
++                param.setCompressionMode( ImageWriteParam.MODE_EXPLICIT );
++                param.setCompressionQuality( (float) Math.max( 0.0D, Math.min( 1.0D, compressionLevel ) ) );
++            }
++            writer.write( null, new IIOImage( image, null, null ), param );
++        } finally
++        {
++            writer.dispose();
++        }
++        return "data:image/png;base64," + Base64.getEncoder().encodeToString( stream.toByteArray() );
++    }
++}
+diff --git a/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java b/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
+index a9b3c0f4..19f1295d 100644
+--- a/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
++++ b/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
+@@ -81,6 +81,30 @@ public abstract class Configuration implements ProxyConfig
+      * xwaterfall.yml by {@code WaterfallConfiguration}.
+      */
+     protected String forwardingSecret = "";
++    // XWaterfall start - custom MOTD options (loaded from xwaterfall.yml by WaterfallConfiguration)
++    /**
++     * Protocol id reported in the server list ping, or -1 to echo the client's
++     * own protocol so the server is never shown as outdated.
++     */
++    protected int motdProtocolVersion = -1;
++    /**
++     * Hide the favicon from the ping response while a ping attack is detected.
++     */
++    protected boolean hideFaviconOnAttack = true;
++    /**
++     * Multiplier applied to the real online count shown in the ping.
++     */
++    protected double onlineMultiplier = 1.0D;
++    /**
++     * Custom MOTD template (MiniMessage / legacy / hex). Empty falls back to the
++     * listener MOTD from config.yml.
++     */
++    protected String customMotd = "";
++    /**
++     * Max player count shown in the ping, or -1 to use the listener value.
++     */
++    protected int motdMaxPlayers = -1;
++    // XWaterfall end
+     private Favicon favicon;
+     private int compressionThreshold = 256;
+     private boolean preventProxyConnections;
+diff --git a/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java b/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java
+index 9d29bf32..ff58e2db 100644
+--- a/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java
++++ b/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java
+@@ -296,11 +296,33 @@ public class InitialHandler extends PacketHandler implements PendingConnection
+ 
+     private ServerPing getPingInfo(String motd, int protocol)
+     {
++        // XWaterfall start - custom MOTD (online booster, custom player count, MiniMessage motd, attack favicon hiding)
++        net.md_5.bungee.conf.Configuration config = BungeeCord.getInstance().config;
++        int online = (int) Math.round( bungee.getOnlineCount() * config.getOnlineMultiplier() );
++        int max = ( config.getMotdMaxPlayers() > 0 ) ? config.getMotdMaxPlayers() : listener.getMaxPlayers();
++
++        net.md_5.bungee.api.chat.BaseComponent description;
++        String custom = config.getCustomMotd();
++        if ( custom != null && !custom.isEmpty() )
++        {
++            description = io.github.waterfallmc.waterfall.motd.MotdManager.render( custom, online, max );
++        } else
++        {
++            description = net.md_5.bungee.api.chat.TextComponent.fromLegacy( motd );
++        }
++
++        net.md_5.bungee.api.Favicon favicon = config.getFaviconObject();
++        if ( config.isHideFaviconOnAttack() && io.github.waterfallmc.waterfall.motd.AttackTracker.isUnderAttack() )
++        {
++            favicon = null;
++        }
++
+         return new ServerPing(
+                 new ServerPing.Protocol( bungee.getName() + " " + bungee.getGameVersion(), protocol ),
+-                new ServerPing.Players( listener.getMaxPlayers(), bungee.getOnlineCount(), null ),
+-                motd, BungeeCord.getInstance().config.getFaviconObject()
++                new ServerPing.Players( max, online, null ),
++                description, favicon
+         );
++        // XWaterfall end
+     }
+ 
+     @Override
+@@ -309,9 +331,13 @@ public class InitialHandler extends PacketHandler implements PendingConnection
+         Preconditions.checkState( thisState == State.STATUS, "Not expecting STATUS" );
+         thisState = null; // don't accept multiple status requests and set state to ping in async event callback
+ 
++        io.github.waterfallmc.waterfall.motd.AttackTracker.recordPing(); // XWaterfall - ping attack detection
++
+         ServerInfo forced = AbstractReconnectHandler.getForcedHost( this );
+         final String motd = ( forced != null ) ? forced.getMotd() : listener.getMotd();
+-        final int protocol = ( ProtocolConstants.SUPPORTED_VERSION_IDS.contains( handshake.getProtocolVersion() ) ) ? handshake.getProtocolVersion() : bungee.getProtocolVersion();
++        // XWaterfall - configurable ping protocol: -1 echoes the client's own protocol (never "outdated")
++        final int configuredProtocol = BungeeCord.getInstance().config.getMotdProtocolVersion();
++        final int protocol = ( configuredProtocol >= 0 ) ? configuredProtocol : handshake.getProtocolVersion();
+ 
+         Callback<ServerPing> pingBack = new Callback<ServerPing>()
+         {
+diff --git a/proxy/src/main/resources/xwaterfall.yml b/proxy/src/main/resources/xwaterfall.yml
+index 5f8afad8..54467f9f 100644
+--- a/proxy/src/main/resources/xwaterfall.yml
++++ b/proxy/src/main/resources/xwaterfall.yml
+@@ -35,3 +35,50 @@ forwarding_mode: BUNGEECORD_LEGACY
+ # - For BUNGEEGUARD it must match the token configured in the BungeeGuard plugin.
+ # Keep it long and random. Ignored when forwarding_mode is BUNGEECORD_LEGACY.
+ forwarding_secret: ''
++
++# ---------------------------------------------------------------------------
++#  Server list ping (MOTD)
++# ---------------------------------------------------------------------------
++motd:
++  # What game protocol should be reported in the motd?
++  # -1 - the connecting client's own protocol is used, so the server is never
++  #      shown as outdated for any supported version.
++  # Any other number forces that exact protocol id.
++  protocol-version: -1
++
++  # Should the favicon be hidden when a ping attack is detected?
++  # Helps to save traffic, because the StatusResponse packet is never compressed,
++  # which means it can weigh at least 8 kilobytes.
++  hide-favicon-on-attack: true
++
++  # How many server list pings per second are treated as an attack.
++  # Used together with hide-favicon-on-attack. Set to -1 to disable detection.
++  attack-pings-per-second: 60
++
++  # The path to the favicon. Disabled if empty. Must be a 64x64 PNG.
++  favicon-path: "server-icon.png"
++
++  # How hard to compress the favicon?
++  # The closer the value is to zero, the stronger the compression.
++  # Fractional values from 0.0 to 1.0 are allowed. -1 - to disable.
++  favicon-compression-level: 0.0
++
++  # Online count booster. The online shown in the ping is computed as
++  # round(real online * multiplier). 1.0 keeps the real value.
++  online-multiplier: 1.0
++
++  # Configuration for the custom motd.
++  # The default format is MiniMessage, which allows RGB colors and gradients.
++  # For more information: https://docs.advntr.dev/minimessage/index.html
++  # Legacy '&' / section color codes and hex (&x&R&R&G&G&B&B / section x ...) are
++  # also supported and auto-detected. To create a new line use the placeholder {NL}
++  custom:
++    # Standard motd message. Leave empty to use the listener motd from config.yml.
++    #
++    # Available placeholders:
++    # - {PLAYER_ONLINE}:     Current online players (after the multiplier).
++    # - {PLAYER_ONLINE_MAX}: Max online players (the max-players value below).
++    motd: "<gradient:#FCA005:#FFCF00><bold>XWaterfall</bold></gradient> <dark_gray>▶ <gray>powered proxy{NL}<gray>Welcome, <white>{PLAYER_ONLINE}<gray>/<white>{PLAYER_ONLINE_MAX} <gray>online"
++
++    # Maximum number of players shown in the ping.
++    max-players: 100
+-- 
+2.50.1 (Apple Git-155)
+
