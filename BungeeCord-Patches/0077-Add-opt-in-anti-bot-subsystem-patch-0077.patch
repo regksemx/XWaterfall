@@ -1,0 +1,619 @@
+From a17d41de9ccec0a290081ae6adc2de6e117dc246 Mon Sep 17 00:00:00 2001
+From: regksem <regksem@tuta.io>
+Date: Fri, 19 Jun 2026 21:52:30 +0300
+Subject: [PATCH] Add opt-in anti-bot subsystem (patch 0077)
+
+New net.regksem.xwaterfall.antibot.AntiBot, wired into the login path:
+- login-rate attack detector that flips the proxy into 'under attack' mode;
+- reconnect 'firewall' (under attack): a new IP is kicked once and only let in
+  after it reconnects within a configurable window;
+- per-IP concurrent connection cap, accounted via BungeeCord add/removeConnection;
+- username regex allow-list and, under attack, blocking of raw-IP joins.
+
+All opt-in via antibot.* in xwaterfall.yml and disabled by default, so a stock
+config is unchanged. The two attack-gated checks never touch normal players.
+
+diff --git a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
+index 871e6bb5..fc734202 100644
+--- a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
++++ b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
+@@ -120,6 +120,41 @@ public class WaterfallConfiguration extends Configuration {
+         maxChatMessagesPerSecond = xConfig.getInt("antiexploit.max-chat-messages-per-second", maxChatMessagesPerSecond);
+         maxPacketBytes = xConfig.getInt("antiexploit.max-packet-bytes", maxPacketBytes);
+         maxTabCompleteRequestLength = xConfig.getInt("antiexploit.max-tab-complete-request-length", maxTabCompleteRequestLength);
++
++        // Anti-bot
++        applyAntiBot(xConfig);
++    }
++
++    /**
++     * Re-reads only the {@code antibot.*} section of {@code xwaterfall.yml},
++     * re-rendering and re-caching the kick messages. Backs
++     * {@code /xwaterfall antibot reload}.
++     */
++    public void reloadAntiBot() {
++        XWaterfallConfig xConfig = new XWaterfallConfig(new File(XWaterfallConfig.FILE_NAME));
++        xConfig.load();
++        applyAntiBot(xConfig);
++    }
++
++    /**
++     * Pushes the {@code antibot.*} options into the static
++     * {@link net.regksem.xwaterfall.antibot.AntiBot} subsystem.
++     */
++    private void applyAntiBot(XWaterfallConfig xConfig) {
++        net.regksem.xwaterfall.antibot.AntiBot.setEnabled(xConfig.getBoolean("antibot.enabled", false));
++        net.regksem.xwaterfall.antibot.AntiBot.setAttackJoinsPerSecond(xConfig.getInt("antibot.attack-joins-per-second", -1));
++        net.regksem.xwaterfall.antibot.AntiBot.setReconnect(
++                xConfig.getInt("antibot.reconnect.min-delay-ms", 1000),
++                xConfig.getInt("antibot.reconnect.window-ms", 30000),
++                xConfig.getInt("antibot.reconnect.verified-duration-ms", 600000));
++        net.regksem.xwaterfall.antibot.AntiBot.setMaxConnectionsPerIp(xConfig.getInt("antibot.max-connections-per-ip", 0));
++        net.regksem.xwaterfall.antibot.AntiBot.setBlockDirectIp(xConfig.getBoolean("antibot.block-direct-ip", true));
++        net.regksem.xwaterfall.antibot.AntiBot.setNamePattern(xConfig.getString("antibot.name-pattern", ""));
++        net.regksem.xwaterfall.antibot.AntiBot.setMessages(
++                xConfig.getString("antibot.messages.reconnect", null),
++                xConfig.getString("antibot.messages.name", null),
++                xConfig.getString("antibot.messages.direct-ip", null),
++                xConfig.getString("antibot.messages.ip-limit", null));
+     }
+ 
+     /**
+diff --git a/proxy/src/main/java/net/md_5/bungee/BungeeCord.java b/proxy/src/main/java/net/md_5/bungee/BungeeCord.java
+index 1e86e095..7ca239dd 100644
+--- a/proxy/src/main/java/net/md_5/bungee/BungeeCord.java
++++ b/proxy/src/main/java/net/md_5/bungee/BungeeCord.java
+@@ -773,6 +773,7 @@ public class BungeeCord extends ProxyServer
+         {
+             connectionLock.writeLock().unlock();
+         }
++        net.regksem.xwaterfall.antibot.AntiBot.onConnectionOpened( con.getSocketAddress() ); // XWaterfall - anti-bot per-IP count
+         return true;
+     }
+ 
+@@ -785,6 +786,7 @@ public class BungeeCord extends ProxyServer
+             connections.remove( con.getName() );
+             connectionsByUUID.remove( con.getUniqueId() );
+             connectionsByOfflineUUID.remove( con.getPendingConnection().getOfflineId() );
++            net.regksem.xwaterfall.antibot.AntiBot.onConnectionClosed( con.getSocketAddress() ); // XWaterfall - anti-bot per-IP count
+         }
+     }
+ 
+diff --git a/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java b/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java
+index 6d9e7d58..f060014f 100644
+--- a/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java
++++ b/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java
+@@ -472,6 +472,13 @@ public class InitialHandler extends PacketHandler implements PendingConnection
+                     disconnect( bungee.getTranslation( "reject_transfer" ) );
+                     return;
+                 }
++
++                // XWaterfall - anti-bot: under attack, refuse raw-IP joins (legit players use the domain)
++                if ( net.regksem.xwaterfall.antibot.AntiBot.blocksDirectIp( handshake.getHost() ) )
++                {
++                    disconnect( net.regksem.xwaterfall.antibot.AntiBot.directIpMessage() );
++                    return;
++                }
+                 break;
+             default:
+                 throw new QuietException( "Cannot request protocol " + handshake.getRequestedProtocol() );
+@@ -489,6 +496,15 @@ public class InitialHandler extends PacketHandler implements PendingConnection
+             return;
+         }
+ 
++        // XWaterfall - anti-bot: rate tracking + name / per-IP / reconnect checks
++        net.regksem.xwaterfall.antibot.AntiBot.recordJoinAttempt();
++        net.regksem.xwaterfall.antibot.AntiBot.Result antiBot = net.regksem.xwaterfall.antibot.AntiBot.checkLogin( getSocketAddress(), loginRequest.getData() );
++        if ( antiBot != net.regksem.xwaterfall.antibot.AntiBot.Result.ALLOW )
++        {
++            disconnect( net.regksem.xwaterfall.antibot.AntiBot.message( antiBot ) );
++            return;
++        }
++
+         if ( BungeeCord.getInstance().config.isEnforceSecureProfile() && getVersion() < ProtocolConstants.MINECRAFT_1_19_3 )
+         {
+             if ( handshake.getProtocolVersion() < ProtocolConstants.MINECRAFT_1_19 ) {disconnect(bungee.getTranslation("secure_profile_unsupported"));} // Waterfall - Tell old clients to update if secure profiles are required
+diff --git a/proxy/src/main/java/net/regksem/xwaterfall/antibot/AntiBot.java b/proxy/src/main/java/net/regksem/xwaterfall/antibot/AntiBot.java
+new file mode 100644
+index 00000000..9b5d1376
+--- /dev/null
++++ b/proxy/src/main/java/net/regksem/xwaterfall/antibot/AntiBot.java
+@@ -0,0 +1,344 @@
++package net.regksem.xwaterfall.antibot;
++
++import com.google.common.net.InetAddresses;
++import java.net.InetSocketAddress;
++import java.net.SocketAddress;
++import java.util.Iterator;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.regex.Pattern;
++import net.md_5.bungee.api.chat.BaseComponent;
++import net.regksem.xwaterfall.motd.MotdManager;
++
++/**
++ * Proxy-level anti-bot facilities, integrated with {@code InitialHandler} and the
++ * connection lifecycle. Everything is static and lock-free; all state is held in
++ * concurrent maps and atomics so it can be touched from any Netty worker thread.
++ *
++ * <p>The whole subsystem is opt-in ({@link #enabled}) and defaults to off, so a
++ * stock configuration behaves exactly like upstream. Two of the checks
++ * (reconnect verification and direct-IP blocking) only engage while an attack is
++ * detected, so legitimate players are untouched during normal operation.
++ */
++public final class AntiBot
++{
++
++    private AntiBot()
++    {
++    }
++
++    // ---- configuration (pushed in from WaterfallConfiguration) ----
++    private static volatile boolean enabled = false;
++    private static volatile int attackJoinsPerSecond = -1; // -1 = attack mode never auto-engages
++    private static volatile long reconnectMinDelayMs = 1000L;
++    private static volatile long reconnectWindowMs = 30_000L;
++    private static volatile long verifiedDurationMs = 600_000L;
++    private static volatile int maxConnectionsPerIp = 0; // 0 = disabled
++    private static volatile boolean blockDirectIp = true; // only enforced under attack
++    private static volatile Pattern namePattern = null; // null = accept any name
++
++    // Messages are pre-rendered into chat components once at (re)load, so the
++    // colour pipeline never runs on the hot login path.
++    private static volatile BaseComponent msgReconnect = MotdManager.renderComponent( "&eVerifying your connection, please reconnect." );
++    private static volatile BaseComponent msgName = MotdManager.renderComponent( "&cYour username is not allowed on this server." );
++    private static volatile BaseComponent msgDirectIp = MotdManager.renderComponent( "&cPlease connect using the server address, not its IP." );
++    private static volatile BaseComponent msgIpLimit = MotdManager.renderComponent( "&cToo many connections from your IP address." );
++
++    // ---- rolling join-rate counter (1s buckets) ----
++    private static volatile long currentSecond = 0L;
++    private static final AtomicInteger currentCount = new AtomicInteger();
++    private static volatile int lastSecondCount = 0;
++
++    // ---- reconnect firewall state ----
++    private static final Map<String, Long> verified = new ConcurrentHashMap<>(); // ip -> expiry (ms)
++    private static final Map<String, Long> pending = new ConcurrentHashMap<>();   // ip -> first-seen (ms)
++
++    // ---- per-IP online connection counts ----
++    private static final Map<String, AtomicInteger> connectionCounts = new ConcurrentHashMap<>();
++
++    private static final int MAP_SWEEP_THRESHOLD = 10_000;
++
++    // ---- the kick outcomes of a login check ----
++    public enum Result
++    {
++        ALLOW, KICK_RECONNECT, KICK_NAME, KICK_DIRECT_IP, KICK_IP_LIMIT;
++    }
++
++    public static boolean isEnabled()
++    {
++        return enabled;
++    }
++
++    /**
++     * Records a login attempt and rolls the per-second counter. Call once at the
++     * very start of handling a login request.
++     */
++    public static void recordJoinAttempt()
++    {
++        if ( !enabled )
++        {
++            return;
++        }
++        long second = System.currentTimeMillis() / 1000L;
++        if ( second != currentSecond )
++        {
++            currentSecond = second;
++            lastSecondCount = currentCount.getAndSet( 0 );
++        }
++        currentCount.incrementAndGet();
++    }
++
++    /**
++     * @return true while the most recent completed second saw at least
++     *         {@code attack-joins-per-second} login attempts
++     */
++    public static boolean isUnderAttack()
++    {
++        if ( !enabled || attackJoinsPerSecond <= 0 )
++        {
++            return false;
++        }
++        long second = System.currentTimeMillis() / 1000L;
++        // If a whole second elapsed with no joins, the last bucket is stale: not under attack.
++        int recent = ( second - currentSecond <= 1L ) ? Math.max( lastSecondCount, currentCount.get() ) : 0;
++        return recent >= attackJoinsPerSecond;
++    }
++
++    /**
++     * Whether a handshake using the given virtual host should be refused. Only
++     * blocks raw-IP connections, and only while under attack.
++     */
++    public static boolean blocksDirectIp(String host)
++    {
++        if ( !enabled || !blockDirectIp || !isUnderAttack() || host == null )
++        {
++            return false;
++        }
++        String trimmed = host.trim();
++        return !trimmed.isEmpty() && InetAddresses.isInetAddress( trimmed );
++    }
++
++    /**
++     * Runs the per-login checks (name pattern, per-IP cap, reconnect firewall).
++     *
++     * @return {@link Result#ALLOW} to let the login proceed, otherwise the kick
++     *         reason to disconnect with
++     */
++    public static Result checkLogin(SocketAddress address, String name)
++    {
++        if ( !enabled )
++        {
++            return Result.ALLOW;
++        }
++        // Username pattern (always enforced when configured).
++        Pattern pattern = namePattern;
++        if ( pattern != null && ( name == null || !pattern.matcher( name ).matches() ) )
++        {
++            return Result.KICK_NAME;
++        }
++
++        String ip = ip( address );
++
++        // Per-IP concurrent connection cap (always enforced when configured).
++        if ( maxConnectionsPerIp > 0 )
++        {
++            AtomicInteger count = connectionCounts.get( ip );
++            if ( count != null && count.get() >= maxConnectionsPerIp )
++            {
++                return Result.KICK_IP_LIMIT;
++            }
++        }
++
++        // Reconnect firewall (only while under attack).
++        if ( isUnderAttack() )
++        {
++            long now = System.currentTimeMillis();
++            Long expiry = verified.get( ip );
++            if ( expiry != null && expiry > now )
++            {
++                return Result.ALLOW; // already verified within its window
++            }
++
++            Long firstSeen = pending.get( ip );
++            if ( firstSeen != null )
++            {
++                long age = now - firstSeen;
++                if ( age >= reconnectMinDelayMs && age <= reconnectWindowMs )
++                {
++                    // A genuine reconnect inside the window: promote to verified.
++                    verified.put( ip, now + verifiedDurationMs );
++                    pending.remove( ip );
++                    sweepIfNeeded( now );
++                    return Result.ALLOW;
++                }
++            }
++            // First contact (or too fast / too late): make them reconnect.
++            pending.put( ip, now );
++            sweepIfNeeded( now );
++            return Result.KICK_RECONNECT;
++        }
++
++        return Result.ALLOW;
++    }
++
++    /** Resolves the pre-rendered kick component for a non-ALLOW result. */
++    public static BaseComponent message(Result result)
++    {
++        switch ( result )
++        {
++            case KICK_NAME:
++                return msgName;
++            case KICK_DIRECT_IP:
++                return msgDirectIp;
++            case KICK_IP_LIMIT:
++                return msgIpLimit;
++            case KICK_RECONNECT:
++            default:
++                return msgReconnect;
++        }
++    }
++
++    public static BaseComponent directIpMessage()
++    {
++        return msgDirectIp;
++    }
++
++    // ---- per-IP connection accounting (called from BungeeCord add/remove) ----
++
++    public static void onConnectionOpened(SocketAddress address)
++    {
++        if ( !enabled || maxConnectionsPerIp <= 0 )
++        {
++            return;
++        }
++        connectionCounts.computeIfAbsent( ip( address ), k -> new AtomicInteger() ).incrementAndGet();
++    }
++
++    public static void onConnectionClosed(SocketAddress address)
++    {
++        if ( maxConnectionsPerIp <= 0 )
++        {
++            return;
++        }
++        String ip = ip( address );
++        AtomicInteger count = connectionCounts.get( ip );
++        if ( count != null && count.decrementAndGet() <= 0 )
++        {
++            connectionCounts.remove( ip, count );
++        }
++    }
++
++    // ---- helpers ----
++
++    private static String ip(SocketAddress address)
++    {
++        if ( address instanceof InetSocketAddress )
++        {
++            InetSocketAddress isa = (InetSocketAddress) address;
++            if ( isa.getAddress() != null )
++            {
++                return isa.getAddress().getHostAddress();
++            }
++        }
++        return String.valueOf( address );
++    }
++
++    /**
++     * Bounds the firewall maps under heavy attack by dropping entries that can no
++     * longer affect a decision. Only runs once a map grows past a threshold.
++     */
++    private static void sweepIfNeeded(long now)
++    {
++        if ( pending.size() > MAP_SWEEP_THRESHOLD )
++        {
++            for ( Iterator<Map.Entry<String, Long>> it = pending.entrySet().iterator(); it.hasNext(); )
++            {
++                if ( now - it.next().getValue() > reconnectWindowMs )
++                {
++                    it.remove();
++                }
++            }
++        }
++        if ( verified.size() > MAP_SWEEP_THRESHOLD )
++        {
++            for ( Iterator<Map.Entry<String, Long>> it = verified.entrySet().iterator(); it.hasNext(); )
++            {
++                if ( it.next().getValue() <= now )
++                {
++                    it.remove();
++                }
++            }
++        }
++    }
++
++    // ---- configuration setters (called from WaterfallConfiguration) ----
++
++    public static void setEnabled(boolean value)
++    {
++        enabled = value;
++    }
++
++    public static void setAttackJoinsPerSecond(int value)
++    {
++        attackJoinsPerSecond = value;
++    }
++
++    public static void setReconnect(long minDelayMs, long windowMs, long verifiedDurationMs)
++    {
++        AntiBot.reconnectMinDelayMs = Math.max( 0L, minDelayMs );
++        AntiBot.reconnectWindowMs = Math.max( AntiBot.reconnectMinDelayMs, windowMs );
++        AntiBot.verifiedDurationMs = Math.max( 0L, verifiedDurationMs );
++    }
++
++    public static void setMaxConnectionsPerIp(int value)
++    {
++        maxConnectionsPerIp = Math.max( 0, value );
++    }
++
++    public static void setBlockDirectIp(boolean value)
++    {
++        blockDirectIp = value;
++    }
++
++    public static void setNamePattern(String regex)
++    {
++        if ( regex == null || regex.isEmpty() )
++        {
++            namePattern = null;
++            return;
++        }
++        try
++        {
++            namePattern = Pattern.compile( regex );
++        } catch ( java.util.regex.PatternSyntaxException ex )
++        {
++            namePattern = null;
++        }
++    }
++
++    /**
++     * Re-renders the kick messages from raw templates into cached components
++     * (full MiniMessage / legacy / hex support). A null leaves the current
++     * value (i.e. the built-in default) in place.
++     */
++    public static void setMessages(String reconnect, String name, String directIp, String ipLimit)
++    {
++        if ( reconnect != null )
++        {
++            msgReconnect = MotdManager.renderComponent( reconnect );
++        }
++        if ( name != null )
++        {
++            msgName = MotdManager.renderComponent( name );
++        }
++        if ( directIp != null )
++        {
++            msgDirectIp = MotdManager.renderComponent( directIp );
++        }
++        if ( ipLimit != null )
++        {
++            msgIpLimit = MotdManager.renderComponent( ipLimit );
++        }
++    }
++}
+diff --git a/proxy/src/main/java/net/regksem/xwaterfall/command/CommandXWaterfall.java b/proxy/src/main/java/net/regksem/xwaterfall/command/CommandXWaterfall.java
+index 92d64e39..224b263a 100644
+--- a/proxy/src/main/java/net/regksem/xwaterfall/command/CommandXWaterfall.java
++++ b/proxy/src/main/java/net/regksem/xwaterfall/command/CommandXWaterfall.java
+@@ -8,9 +8,10 @@ import net.md_5.bungee.conf.Configuration;
+ import io.github.waterfallmc.waterfall.conf.WaterfallConfiguration;
+ 
+ /**
+- * XWaterfall administration command. Currently exposes {@code motd reload},
+- * which re-reads the {@code motd.*} section of {@code xwaterfall.yml} and clears
+- * the cached server-list ping render without restarting listeners.
++ * XWaterfall administration command. Exposes {@code motd reload} (re-reads the
++ * {@code motd.*} section and clears the ping cache) and {@code antibot reload}
++ * (re-reads the {@code antibot.*} section, re-rendering and re-caching its
++ * messages), both without restarting listeners.
+  */
+ public class CommandXWaterfall extends Command
+ {
+@@ -23,20 +24,30 @@ public class CommandXWaterfall extends Command
+     @Override
+     public void execute(CommandSender sender, String[] args)
+     {
+-        if ( args.length == 2 && args[0].equalsIgnoreCase( "motd" ) && args[1].equalsIgnoreCase( "reload" ) )
++        if ( args.length == 2 && args[1].equalsIgnoreCase( "reload" ) )
+         {
+             Configuration config = BungeeCord.getInstance().config;
+-            if ( config instanceof WaterfallConfiguration )
++            if ( !( config instanceof WaterfallConfiguration ) )
+             {
+-                ( (WaterfallConfiguration) config ).reloadMotd();
++                sender.sendMessage( ChatColor.RED + "Reloading is unavailable on this configuration." );
++                return;
++            }
++            WaterfallConfiguration xConfig = (WaterfallConfiguration) config;
++
++            if ( args[0].equalsIgnoreCase( "motd" ) )
++            {
++                xConfig.reloadMotd();
+                 sender.sendMessage( ChatColor.GREEN + "MOTD reloaded from xwaterfall.yml and ping cache cleared." );
+-            } else
++                return;
++            }
++            if ( args[0].equalsIgnoreCase( "antibot" ) )
+             {
+-                sender.sendMessage( ChatColor.RED + "MOTD reload is unavailable on this configuration." );
++                xConfig.reloadAntiBot();
++                sender.sendMessage( ChatColor.GREEN + "Anti-bot settings and messages reloaded from xwaterfall.yml." );
++                return;
+             }
+-            return;
+         }
+ 
+-        sender.sendMessage( ChatColor.RED + "Usage: /xwaterfall motd reload" );
++        sender.sendMessage( ChatColor.RED + "Usage: /xwaterfall <motd|antibot> reload" );
+     }
+ }
+diff --git a/proxy/src/main/java/net/regksem/xwaterfall/motd/MotdManager.java b/proxy/src/main/java/net/regksem/xwaterfall/motd/MotdManager.java
+index 0861f365..1959d861 100644
+--- a/proxy/src/main/java/net/regksem/xwaterfall/motd/MotdManager.java
++++ b/proxy/src/main/java/net/regksem/xwaterfall/motd/MotdManager.java
+@@ -103,9 +103,20 @@ public final class MotdManager
+     {
+         String text = template
+                 .replace( "{PLAYER_ONLINE_MAX}", Integer.toString( max ) )
+-                .replace( "{PLAYER_ONLINE}", Integer.toString( online ) )
+-                .replace( "{NL}", "\n" );
++                .replace( "{PLAYER_ONLINE}", Integer.toString( online ) );
++        return renderComponent( text );
++    }
+ 
++    /**
++     * Renders any user-facing string into a chat component using the same colour
++     * pipeline as the MOTD: MiniMessage by default (RGB / gradients / hex), or
++     * the legacy '&amp;' / section parser (incl. hex) when legacy codes are
++     * detected. {@code {NL}} becomes a newline. Never returns null; on a parse
++     * error the raw text is used. Reused for kick messages and other strings.
++     */
++    public static BaseComponent renderComponent(String text)
++    {
++        text = text.replace( "{NL}", "\n" );
+         try
+         {
+             if ( isLegacy( text ) )
+@@ -116,7 +127,7 @@ public final class MotdManager
+             return new TextComponent( BungeeComponentSerializer.get().serialize( component ) );
+         } catch ( RuntimeException ex )
+         {
+-            ProxyServer.getInstance().getLogger().log( Level.WARNING, "Could not parse custom MOTD, using it as plain text", ex );
++            ProxyServer.getInstance().getLogger().log( Level.WARNING, "Could not parse message, using it as plain text: " + text, ex );
+             return TextComponent.fromLegacy( text );
+         }
+     }
+diff --git a/proxy/src/main/resources/xwaterfall.yml b/proxy/src/main/resources/xwaterfall.yml
+index 3fece123..d6fc2d7d 100644
+--- a/proxy/src/main/resources/xwaterfall.yml
++++ b/proxy/src/main/resources/xwaterfall.yml
+@@ -194,3 +194,54 @@ antiexploit:
+   # legitimate packets such as Forge mod handshakes or login plugin payloads.
+   # The Varint frame decoder already hard-caps frames at ~2 MB regardless.
+   max-packet-bytes: 0
++
++# ---------------------------------------------------------------------------
++#  Anti-bot
++# ---------------------------------------------------------------------------
++# Proxy-level protection against join-floods / bot swarms. Disabled by default;
++# turn it on only if you actually get attacked, and tune the thresholds to your
++# traffic. Two checks (reconnect verification and direct-IP blocking) only
++# engage while an attack is detected, so normal players are never affected by
++# them; the per-IP cap and username filter apply whenever configured.
++antibot:
++  # Master switch for the whole subsystem.
++  enabled: false
++
++  # Logins per second that flip the proxy into "under attack" mode (which turns
++  # on the reconnect check and direct-IP blocking). -1 disables attack detection
++  # entirely, so those two checks never trigger.
++  attack-joins-per-second: 8
++
++  # Reconnect "firewall": while under attack, a new IP is kicked once and only
++  # allowed in after it reconnects. Bots almost never reconnect; real clients do.
++  reconnect:
++    # The reconnect must happen no sooner than this (ms) - filters out clients
++    # that instantly retry in a tight loop.
++    min-delay-ms: 1000
++    # ...and no later than this (ms) after the first attempt.
++    window-ms: 30000
++    # Once verified, an IP is trusted for this long (ms) without re-checking.
++    verified-duration-ms: 600000
++
++  # Max simultaneous online connections from a single IP. 0 disables the cap.
++  # Raise it if many of your players share an IP (NAT / another proxy in front).
++  max-connections-per-ip: 3
++
++  # While under attack, refuse connections made straight to the server IP
++  # (legitimate players connect through the configured domain).
++  block-direct-ip: true
++
++  # Regex every username must match, e.g. "^[A-Za-z0-9_]{3,16}$" to require
++  # vanilla-style names. Empty means accept any (valid) username.
++  name-pattern: ""
++
++  # Kick messages. Each supports the full colour pipeline (auto-detected):
++  # MiniMessage (RGB, <gradient>, <#hex>) by default, or legacy '&' / section
++  # codes incl. hex when those are present. Use {NL} for a new line. Messages are
++  # rendered and cached on startup; run "/xwaterfall antibot reload" to re-read
++  # and re-cache them after editing.
++  messages:
++    reconnect: "<yellow>Verifying your connection, please reconnect."
++    name: "<red>Your username is not allowed on this server."
++    direct-ip: "<red>Please connect using the server address, not its IP."
++    ip-limit: "<red>Too many connections from your IP address."
+-- 
+2.50.1 (Apple Git-155)
+
