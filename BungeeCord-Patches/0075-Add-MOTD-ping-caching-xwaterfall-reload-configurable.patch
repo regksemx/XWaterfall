@@ -1,0 +1,328 @@
+From 863adb5cc1c690e87dec86adf0cc836d5cc5ee4d Mon Sep 17 00:00:00 2001
+From: regksem <regksem@tuta.io>
+Date: Fri, 19 Jun 2026 21:36:11 +0300
+Subject: [PATCH] Add MOTD ping caching, /xwaterfall reload, configurable
+ event-loop threads (patch 0075)
+
+Cache the rendered custom-MOTD component for a configurable window
+(motd.cache-ttl, default 30s) so the MiniMessage/legacy parse no longer runs
+on every server-list ping; the live player count stays fresh per ping. Add a
+/xwaterfall motd reload command to re-read the motd.* section of xwaterfall.yml
+and clear the cache on demand.
+
+Also make the Netty boss/worker event-loop thread counts configurable
+(network.boss-threads default 1, network.worker-threads default 0=auto); the
+groups are now created after config load. The boss group only accepts
+connections, so a single thread avoids wasting idle threads.
+
+diff --git a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
+index bea55c6b..bbede4a4 100644
+--- a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
++++ b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
+@@ -94,21 +94,17 @@ public class WaterfallConfiguration extends Configuration {
+         }
+ 
+         // MOTD / server list ping
+-        motdProtocolVersion = xConfig.getInt("motd.protocol-version", motdProtocolVersion);
+-        hideFaviconOnAttack = xConfig.getBoolean("motd.hide-favicon-on-attack", hideFaviconOnAttack);
+-        onlineMultiplier = xConfig.getDouble("motd.online-multiplier", onlineMultiplier);
+-        customMotd = xConfig.getString("motd.custom.motd", customMotd);
+-        motdMaxPlayers = xConfig.getInt("motd.custom.max-players", motdMaxPlayers);
+-        AttackTracker.setThreshold(xConfig.getInt("motd.attack-pings-per-second", 60));
+-        this.motdFavicon = MotdManager.loadFavicon(
+-                xConfig.getString("motd.favicon-path", "server-icon.png"),
+-                xConfig.getDouble("motd.favicon-compression-level", 0.0D));
++        applyMotd(xConfig);
+ 
+         // Network compression
+         compressionType = xConfig.getString("compression.network.type", compressionType);
+         compressionLevel = xConfig.getInt("compression.network.level", compressionLevel);
+         consolidateFlushes = xConfig.getBoolean("consolidate-flushes", consolidateFlushes);
+ 
++        // Event-loop thread counts
++        bossThreads = Math.max(1, xConfig.getInt("network.boss-threads", bossThreads));
++        workerThreads = Math.max(0, xConfig.getInt("network.worker-threads", workerThreads));
++
+         // Protocol gating
+         disabledProtocols = parseProtocolRanges(xConfig.getStringList("disabled-protocols", java.util.Collections.emptyList()));
+ 
+@@ -125,6 +121,36 @@ public class WaterfallConfiguration extends Configuration {
+         maxTabCompleteRequestLength = xConfig.getInt("antiexploit.max-tab-complete-request-length", maxTabCompleteRequestLength);
+     }
+ 
++    /**
++     * Applies every {@code motd.*} option from the given config and drops the
++     * cached MOTD render so the next ping rebuilds it. Shared by {@link #load()}
++     * and {@link #reloadMotd()}.
++     */
++    private void applyMotd(XWaterfallConfig xConfig) {
++        motdProtocolVersion = xConfig.getInt("motd.protocol-version", motdProtocolVersion);
++        hideFaviconOnAttack = xConfig.getBoolean("motd.hide-favicon-on-attack", hideFaviconOnAttack);
++        onlineMultiplier = xConfig.getDouble("motd.online-multiplier", onlineMultiplier);
++        customMotd = xConfig.getString("motd.custom.motd", customMotd);
++        motdMaxPlayers = xConfig.getInt("motd.custom.max-players", motdMaxPlayers);
++        motdCacheTtl = xConfig.getInt("motd.cache-ttl", (int) (motdCacheTtl / 1000L)) * 1000L;
++        AttackTracker.setThreshold(xConfig.getInt("motd.attack-pings-per-second", 60));
++        this.motdFavicon = MotdManager.loadFavicon(
++                xConfig.getString("motd.favicon-path", "server-icon.png"),
++                xConfig.getDouble("motd.favicon-compression-level", 0.0D));
++        MotdManager.invalidate();
++    }
++
++    /**
++     * Re-reads only the {@code motd.*} section of {@code xwaterfall.yml} and
++     * invalidates the ping cache, without touching listeners or other settings.
++     * Backs the {@code /xwaterfall motd reload} command.
++     */
++    public void reloadMotd() {
++        XWaterfallConfig xConfig = new XWaterfallConfig(new File(XWaterfallConfig.FILE_NAME));
++        xConfig.load();
++        applyMotd(xConfig);
++    }
++
+     /**
+      * Parses {@code disabled-protocols} entries such as {@code "47"} or
+      * {@code "47-753"} into inclusive {@code [min, max]} integer ranges. Invalid
+diff --git a/proxy/src/main/java/io/github/waterfallmc/waterfall/motd/MotdManager.java b/proxy/src/main/java/io/github/waterfallmc/waterfall/motd/MotdManager.java
+index cc70d4bd..ea815ea8 100644
+--- a/proxy/src/main/java/io/github/waterfallmc/waterfall/motd/MotdManager.java
++++ b/proxy/src/main/java/io/github/waterfallmc/waterfall/motd/MotdManager.java
+@@ -38,6 +38,59 @@ public final class MotdManager
+ 
+     private static final String LEGACY_CODE_CHARS = "0123456789abcdefklmnorx";
+ 
++    // XWaterfall start - cache the rendered MOTD component.
++    // Parsing the MiniMessage / legacy template and serializing it into a chat
++    // component is by far the most expensive part of answering a server-list
++    // ping, and the MOTD text changes very rarely. We therefore keep the last
++    // rendered component for a configurable window instead of rebuilding it on
++    // every ping. The live online / max counts shown in the player bar are still
++    // applied fresh per ping by the caller, so only the (rarely changing) MOTD
++    // text itself can lag by at most the cache window.
++    private static volatile BaseComponent cachedDescription;
++    private static volatile String cachedTemplate;
++    private static volatile long cacheExpiryNanos;
++
++    /**
++     * Like {@link #render(String, int, int)} but reuses the previously rendered
++     * component while it is still within the cache window and the template is
++     * unchanged.
++     *
++     * @param ttlMillis how long a rendered component may be reused, in
++     *                  milliseconds; {@code <= 0} disables caching and renders
++     *                  on every call
++     */
++    public static BaseComponent renderCached(String template, int online, int max, long ttlMillis)
++    {
++        if ( ttlMillis <= 0L )
++        {
++            return render( template, online, max );
++        }
++        long now = System.nanoTime();
++        BaseComponent cached = cachedDescription;
++        // now - cacheExpiryNanos < 0 is the overflow-safe "not yet expired" test.
++        if ( cached != null && now - cacheExpiryNanos < 0L && template.equals( cachedTemplate ) )
++        {
++            return cached;
++        }
++        BaseComponent rendered = render( template, online, max );
++        cachedDescription = rendered;
++        cachedTemplate = template;
++        cacheExpiryNanos = now + ttlMillis * 1_000_000L;
++        return rendered;
++    }
++
++    /**
++     * Drops the cached MOTD component so the next ping re-renders the template.
++     * Called when the MOTD configuration is (re)loaded.
++     */
++    public static void invalidate()
++    {
++        cachedDescription = null;
++        cachedTemplate = null;
++        cacheExpiryNanos = 0L;
++    }
++    // XWaterfall end
++
+     /**
+      * Renders a MOTD template into a chat component.
+      *
+diff --git a/proxy/src/main/java/net/md_5/bungee/BungeeCord.java b/proxy/src/main/java/net/md_5/bungee/BungeeCord.java
+index 5abda325..9f9b4c4f 100644
+--- a/proxy/src/main/java/net/md_5/bungee/BungeeCord.java
++++ b/proxy/src/main/java/net/md_5/bungee/BungeeCord.java
+@@ -233,6 +233,7 @@ public class BungeeCord extends ProxyServer
+         getPluginManager().registerCommand( null, new CommandIP() );
+         getPluginManager().registerCommand( null, new CommandBungee() );
+         getPluginManager().registerCommand( null, new CommandPerms() );
++        getPluginManager().registerCommand( null, new net.md_5.bungee.command.CommandXWaterfall() ); // XWaterfall
+ 
+         if ( !Boolean.getBoolean( "net.md_5.bungee.native.disable" ) )
+         {
+@@ -280,9 +281,6 @@ public class BungeeCord extends ProxyServer
+             System.setProperty( "io.netty.allocator.type", "pooled" );
+         }
+ 
+-        bossEventLoopGroup = PipelineUtils.newEventLoopGroup( 0, new ThreadFactoryBuilder().setNameFormat( "Netty Boss IO Thread #%1$d" ).build() );
+-        workerEventLoopGroup = PipelineUtils.newEventLoopGroup( 0, new ThreadFactoryBuilder().setNameFormat( "Netty Worker IO Thread #%1$d" ).build() );
+-
+         File moduleDirectory = new File( "modules" );
+         moduleManager.load( this, moduleDirectory );
+         pluginManager.detectPlugins( moduleDirectory );
+@@ -293,6 +291,12 @@ public class BungeeCord extends ProxyServer
+         pluginManager.loadPlugins();
+         config.load();
+ 
++        // XWaterfall - create the event-loop groups after config load so thread
++        // counts are configurable. Boss only accepts connections (1 thread is
++        // plenty); worker handles all I/O (0 = Netty default of 2x cores).
++        bossEventLoopGroup = PipelineUtils.newEventLoopGroup( config.getBossThreads(), new ThreadFactoryBuilder().setNameFormat( "Netty Boss IO Thread #%1$d" ).build() );
++        workerEventLoopGroup = PipelineUtils.newEventLoopGroup( config.getWorkerThreads(), new ThreadFactoryBuilder().setNameFormat( "Netty Worker IO Thread #%1$d" ).build() );
++
+         if ( config.isForgeSupport() )
+         {
+             registerChannel( ForgeConstants.FML_TAG );
+diff --git a/proxy/src/main/java/net/md_5/bungee/command/CommandXWaterfall.java b/proxy/src/main/java/net/md_5/bungee/command/CommandXWaterfall.java
+new file mode 100644
+index 00000000..f478672a
+--- /dev/null
++++ b/proxy/src/main/java/net/md_5/bungee/command/CommandXWaterfall.java
+@@ -0,0 +1,42 @@
++package net.md_5.bungee.command;
++
++import net.md_5.bungee.BungeeCord;
++import net.md_5.bungee.api.ChatColor;
++import net.md_5.bungee.api.CommandSender;
++import net.md_5.bungee.api.plugin.Command;
++import net.md_5.bungee.conf.Configuration;
++import io.github.waterfallmc.waterfall.conf.WaterfallConfiguration;
++
++/**
++ * XWaterfall administration command. Currently exposes {@code motd reload},
++ * which re-reads the {@code motd.*} section of {@code xwaterfall.yml} and clears
++ * the cached server-list ping render without restarting listeners.
++ */
++public class CommandXWaterfall extends Command
++{
++
++    public CommandXWaterfall()
++    {
++        super( "xwaterfall", "bungeecord.command.xwaterfall", "xwf" );
++    }
++
++    @Override
++    public void execute(CommandSender sender, String[] args)
++    {
++        if ( args.length == 2 && args[0].equalsIgnoreCase( "motd" ) && args[1].equalsIgnoreCase( "reload" ) )
++        {
++            Configuration config = BungeeCord.getInstance().config;
++            if ( config instanceof WaterfallConfiguration )
++            {
++                ( (WaterfallConfiguration) config ).reloadMotd();
++                sender.sendMessage( ChatColor.GREEN + "MOTD reloaded from xwaterfall.yml and ping cache cleared." );
++            } else
++            {
++                sender.sendMessage( ChatColor.RED + "MOTD reload is unavailable on this configuration." );
++            }
++            return;
++        }
++
++        sender.sendMessage( ChatColor.RED + "Usage: /xwaterfall motd reload" );
++    }
++}
+diff --git a/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java b/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
+index 5a6401ea..8e085e81 100644
+--- a/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
++++ b/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
+@@ -108,6 +108,13 @@ public abstract class Configuration implements ProxyConfig
+      * Max player count shown in the ping, or -1 to use the listener value.
+      */
+     protected int motdMaxPlayers = -1;
++    /**
++     * How long, in milliseconds, a rendered custom-MOTD component may be reused
++     * before the template is parsed again. The live online / max counts are
++     * always applied fresh per ping; only the MOTD text lags by at most this
++     * window. 0 disables caching (render on every ping).
++     */
++    protected long motdCacheTtl = 30_000L;
+     // XWaterfall end
+     // XWaterfall start - configurable network compression (loaded from xwaterfall.yml)
+     /**
+@@ -130,6 +137,19 @@ public abstract class Configuration implements ProxyConfig
+      */
+     protected boolean consolidateFlushes = false;
+     // XWaterfall end
++    // XWaterfall start - configurable Netty event-loop thread counts (loaded from xwaterfall.yml)
++    /**
++     * Number of threads in the boss group, which only accepts new connections.
++     * One thread is enough for any realistic number of listeners; raising it
++     * just wastes idle threads. Must be at least 1.
++     */
++    protected int bossThreads = 1;
++    /**
++     * Number of threads in the worker group, which handles all packet I/O.
++     * 0 lets Netty pick its default (2x available processors).
++     */
++    protected int workerThreads = 0;
++    // XWaterfall end
+     // XWaterfall start - anti-exploit / protocol verification options (loaded from xwaterfall.yml)
+     /**
+      * Inclusive protocol-version ranges that are refused at handshake, e.g.
+diff --git a/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java b/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java
+index 6e8ae11f..24764871 100644
+--- a/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java
++++ b/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java
+@@ -305,7 +305,7 @@ public class InitialHandler extends PacketHandler implements PendingConnection
+         String custom = config.getCustomMotd();
+         if ( custom != null && !custom.isEmpty() )
+         {
+-            description = io.github.waterfallmc.waterfall.motd.MotdManager.render( custom, online, max );
++            description = io.github.waterfallmc.waterfall.motd.MotdManager.renderCached( custom, online, max, config.getMotdCacheTtl() );
+         } else
+         {
+             description = net.md_5.bungee.api.chat.TextComponent.fromLegacy( motd );
+diff --git a/proxy/src/main/resources/xwaterfall.yml b/proxy/src/main/resources/xwaterfall.yml
+index e23213c4..3fece123 100644
+--- a/proxy/src/main/resources/xwaterfall.yml
++++ b/proxy/src/main/resources/xwaterfall.yml
+@@ -67,6 +67,16 @@ motd:
+   # round(real online * multiplier). 1.0 keeps the real value.
+   online-multiplier: 1.0
+ 
++  # How long (in seconds) a rendered custom motd is reused before it is parsed
++  # again. Parsing the motd template (MiniMessage / colors) is the most
++  # expensive part of answering a ping, so caching it sharply lowers CPU under
++  # ping spam. The live player count shown in the ping is always fresh; only the
++  # motd TEXT itself can lag by at most this many seconds, so if you embed
++  # {PLAYER_ONLINE} in the text it updates at most once per window.
++  # Use 0 to disable caching and render on every ping. Run "/xwaterfall motd
++  # reload" to apply motd changes immediately without waiting for the window.
++  cache-ttl: 30
++
+   # Configuration for the custom motd.
+   # The default format is MiniMessage, which allows RGB colors and gradients.
+   # For more information: https://docs.advntr.dev/minimessage/index.html
+@@ -115,6 +125,20 @@ compression:
+ # CPU usage at the cost of very rare, slight added latency. Disabled by default.
+ consolidate-flushes: false
+ 
++# ---------------------------------------------------------------------------
++#  Network event-loop threads
++# ---------------------------------------------------------------------------
++# Thread counts for the two Netty event-loop groups.
++# - boss-threads:   threads that only accept incoming connections. One is enough
++#                   for any realistic number of listeners; more just sit idle.
++# - worker-threads: threads that handle all packet I/O. 0 means "let Netty pick"
++#                   (2x available processors), which is the right default for
++#                   almost everyone. Set a fixed number only if you want to cap
++#                   or pin I/O threads.
++network:
++  boss-threads: 1
++  worker-threads: 0
++
+ # ---------------------------------------------------------------------------
+ #  Protocol gating
+ # ---------------------------------------------------------------------------
+-- 
+2.50.1 (Apple Git-155)
+
