@@ -1,0 +1,167 @@
+From 7b7b3d80529f210c4371ff841101fb4758cf3754 Mon Sep 17 00:00:00 2001
+From: regksem <regksem@tuta.io>
+Date: Sat, 20 Jun 2026 01:00:16 +0300
+Subject: [PATCH] Require Java 21 and run plugin async tasks on virtual threads
+
+Bump the compiler target to Java 21 and the bootstrap version gate to the
+matching class-file version, and route each plugin's async task executor to a
+virtual-thread-per-task executor (configurable via use-virtual-threads in
+xwaterfall.yml, default on). Plugin async work is typically blocking I/O, which
+virtual threads carry far more cheaply at high concurrency than a growing pool
+of platform threads. The proxy's own networking is unchanged (already
+non-blocking Netty).
+
+diff --git a/api/src/main/java/net/md_5/bungee/api/ProxyConfig.java b/api/src/main/java/net/md_5/bungee/api/ProxyConfig.java
+index 469fe0e1..b370e9fa 100644
+--- a/api/src/main/java/net/md_5/bungee/api/ProxyConfig.java
++++ b/api/src/main/java/net/md_5/bungee/api/ProxyConfig.java
+@@ -275,4 +275,17 @@ public interface ProxyConfig
+      * @return the configured limit
+      */
+     int getPluginChannelNameLimit();
++
++    // XWaterfall start
++    /**
++     * Whether plugin async tasks should run on virtual threads (Java 21+)
++     * instead of a cached pool of platform threads.
++     *
++     * @return {@code true} if virtual threads are used for plugin async work
++     */
++    default boolean isUseVirtualThreads()
++    {
++        return true;
++    }
++    // XWaterfall end
+ }
+diff --git a/api/src/main/java/net/md_5/bungee/api/plugin/Plugin.java b/api/src/main/java/net/md_5/bungee/api/plugin/Plugin.java
+index faa06a92..4c56ae55 100644
+--- a/api/src/main/java/net/md_5/bungee/api/plugin/Plugin.java
++++ b/api/src/main/java/net/md_5/bungee/api/plugin/Plugin.java
+@@ -129,8 +129,24 @@ public class Plugin
+         if ( service == null )
+         {
+             String name = ( getDescription() == null ) ? "unknown" : getDescription().getName();
+-            service = Executors.newCachedThreadPool( new ThreadFactoryBuilder().setNameFormat( name + " Pool Thread #%1$d" )
+-                    .setThreadFactory( new GroupedThreadFactory( this, name ) ).build() );
++            // XWaterfall start - use a virtual-thread-per-task executor for plugin
++            // async work when enabled. Plugin async tasks are typically blocking
++            // (JDBC, HTTP, Redis); virtual threads let those scale without an
++            // ever-growing pool of pinned platform threads. Falls back to the
++            // classic cached pool when disabled (use-virtual-threads: false) or
++            // when the config is not available yet.
++            ProxyServer proxy = ProxyServer.getInstance();
++            boolean virtual = ( proxy == null || proxy.getConfig() == null ) || proxy.getConfig().isUseVirtualThreads();
++            if ( virtual )
++            {
++                service = Executors.newThreadPerTaskExecutor( Thread.ofVirtual()
++                        .name( name + " Virtual Pool Thread #", 1 ).factory() );
++            } else
++            {
++                service = Executors.newCachedThreadPool( new ThreadFactoryBuilder().setNameFormat( name + " Pool Thread #%1$d" )
++                        .setThreadFactory( new GroupedThreadFactory( this, name ) ).build() );
++            }
++            // XWaterfall end
+         }
+         return service;
+     }
+diff --git a/bootstrap/src/main/java/net/md_5/bungee/Bootstrap.java b/bootstrap/src/main/java/net/md_5/bungee/Bootstrap.java
+index cbb740c9..143463c0 100644
+--- a/bootstrap/src/main/java/net/md_5/bungee/Bootstrap.java
++++ b/bootstrap/src/main/java/net/md_5/bungee/Bootstrap.java
+@@ -5,9 +5,9 @@ public class Bootstrap
+ 
+     public static void main(String[] args) throws Exception
+     {
+-        if ( Float.parseFloat( System.getProperty( "java.class.version" ) ) < 61.0 )
++        if ( Float.parseFloat( System.getProperty( "java.class.version" ) ) < 65.0 )
+         {
+-            System.err.println( "*** ERROR *** Waterfall requires Java 17 or above to function! Please download and install it!" );
++            System.err.println( "*** ERROR *** XWaterfall requires Java 21 or above to function! Please download and install it!" );
+             System.out.println( "You can check your Java version with the command: java -version" );
+             return;
+         }
+diff --git a/pom.xml b/pom.xml
+index 81df4e08..423c3b66 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -95,7 +95,7 @@
+     <properties>
+         <build.number>unknown</build.number>
+         <lombok.version>1.18.46</lombok.version>
+-        <maven.compiler.release>17</maven.compiler.release>
++        <maven.compiler.release>21</maven.compiler.release>
+         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+         <log4j2.version>2.25.3</log4j2.version>
+     </properties>
+@@ -299,7 +299,7 @@
+                                 <reactorModuleConvergence/>
+                                 <requireExplicitDependencyScope/>
+                                 <enforceBytecodeVersion>
+-                                    <maxJdkVersion>17</maxJdkVersion>
++                                    <maxJdkVersion>21</maxJdkVersion>
+                                     <ignoreClasses>
+                                         <ignoreClass>org.jline.terminal.impl.ffm.*</ignoreClass>
+                                     </ignoreClasses>
+diff --git a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
+index 2a5dc991..fa42d71a 100644
+--- a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
++++ b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
+@@ -104,6 +104,11 @@ public class WaterfallConfiguration extends Configuration {
+         bossThreads = Math.max(1, xConfig.getInt("network.boss-threads", bossThreads));
+         workerThreads = Math.max(0, xConfig.getInt("network.worker-threads", workerThreads));
+ 
++        // Virtual threads for plugin async tasks. Bound when a plugin first
++        // creates its executor, so changing this requires a restart for already
++        // started plugins.
++        useVirtualThreads = xConfig.getBoolean("use-virtual-threads", useVirtualThreads);
++
+         // Protocol gating, connection-error hiding and anti-spam caps (runtime-reloadable)
+         applyAntiExploit(xConfig);
+ 
+diff --git a/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java b/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
+index cec89526..db5e94bd 100644
+--- a/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
++++ b/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
+@@ -138,6 +138,15 @@ public abstract class Configuration implements ProxyConfig
+      */
+     protected boolean consolidateFlushes = false;
+     // XWaterfall end
++    // XWaterfall start - virtual threads for plugin async tasks (loaded from xwaterfall.yml)
++    /**
++     * When enabled, each plugin's async task executor uses a virtual-thread-per-task
++     * executor (Java 21+) instead of a cached pool of platform threads. Plugin
++     * async work is usually blocking I/O, which virtual threads handle far more
++     * cheaply at high concurrency. Enabled by default.
++     */
++    protected boolean useVirtualThreads = true;
++    // XWaterfall end
+     // XWaterfall start - configurable Netty event-loop thread counts (loaded from xwaterfall.yml)
+     /**
+      * Number of threads in the boss group, which only accepts new connections.
+diff --git a/proxy/src/main/resources/xwaterfall.yml b/proxy/src/main/resources/xwaterfall.yml
+index d61644c5..8279edb6 100644
+--- a/proxy/src/main/resources/xwaterfall.yml
++++ b/proxy/src/main/resources/xwaterfall.yml
+@@ -139,6 +139,19 @@ network:
+   boss-threads: 1
+   worker-threads: 0
+ 
++# ---------------------------------------------------------------------------
++#  Virtual threads (Java 21+)
++# ---------------------------------------------------------------------------
++# Run each plugin's async task executor on a virtual-thread-per-task executor
++# instead of a cached pool of platform threads. Plugin async tasks are usually
++# blocking I/O (database, HTTP, Redis); virtual threads carry many such tasks at
++# once without the overhead and thread-exhaustion of a growing platform-thread
++# pool. This does NOT affect the proxy's own networking, which is already
++# non-blocking (Netty), so the gain is proportional to how much blocking async
++# work your plugins do. Bound when a plugin first starts, so a change takes
++# effect on the next restart. Leave enabled unless a plugin misbehaves under it.
++use-virtual-threads: true
++
+ # ---------------------------------------------------------------------------
+ #  Protocol gating
+ # ---------------------------------------------------------------------------
+-- 
+2.50.1 (Apple Git-155)
+

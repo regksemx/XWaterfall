@@ -14,11 +14,11 @@ XWaterfall focuses on:
 
 ## How To (Server Admins)
 
-Build a copy of `XWaterfall.jar` from source (see below). XWaterfall requires **Java 8** or above.
+Build a copy of `XWaterfall.jar` from source (see below). XWaterfall requires **Java 21** or above.
 
 ## How To (Compiling From Source)
 
-To compile XWaterfall, you need a JDK (8+), git, bash, maven, and an internet connection.
+To compile XWaterfall, you need a JDK (21+), git, bash, maven, and an internet connection.
 
 ```bash
 git clone --recursive https://github.com/regksemx/XWaterfall.git
