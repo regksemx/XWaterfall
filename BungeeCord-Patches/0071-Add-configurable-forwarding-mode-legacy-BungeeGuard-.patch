@@ -1,17 +1,173 @@
-From 2935319b41cd455392c73924e278541aca8c9406 Mon Sep 17 00:00:00 2001
+From 5a066b9db00c1ebb331727bd4330e551d636e88d Mon Sep 17 00:00:00 2001
 From: regksem <regksem@tuta.io>
 Date: Fri, 19 Jun 2026 18:23:15 +0300
 Subject: [PATCH] Add configurable forwarding mode (legacy, BungeeGuard,
  Velocity modern)
 
-Adds a forwarding_mode + forwarding_secret option selecting how player
-information is forwarded to backend servers when ip_forward is enabled:
+Adds a dedicated xwaterfall.yml config exposing forwarding_mode +
+forwarding_secret, selecting how player information is forwarded to backend
+servers when ip_forward is enabled in config.yml:
 
 - BUNGEECORD_LEGACY (default): unchanged classic BungeeCord forwarding.
 - BUNGEEGUARD: appends the shared secret as a bungeeguard-token property.
 - VELOCITY_MODERN: answers the velocity:player_info login plugin request
   with HMAC-SHA256 signed forwarding data (keyless v1).
 
+xwaterfall.yml is shipped as a commented default resource and read strictly
+read-only (XWaterfallConfig) so comments are preserved across restarts and
+upgrades; missing keys fall back to code defaults.
+
+diff --git a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
+index da0efa36..4a059257 100644
+--- a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
++++ b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
+@@ -1,11 +1,14 @@
+ package io.github.waterfallmc.waterfall.conf;
+ 
+ import com.google.common.base.Joiner;
++import net.md_5.bungee.api.ProxyServer;
+ import net.md_5.bungee.conf.Configuration;
++import net.md_5.bungee.conf.ForwardingMode;
+ import net.md_5.bungee.conf.YamlConfig;
+ import net.md_5.bungee.protocol.ProtocolConstants;
+ 
+ import java.io.File;
++import java.util.logging.Level;
+ 
+ public class WaterfallConfiguration extends Configuration {
+ 
+@@ -77,6 +80,15 @@ public class WaterfallConfiguration extends Configuration {
+         disableTabListRewrite = config.getBoolean("disable_tab_list_rewrite", disableTabListRewrite);
+         pluginChannelLimit = config.getInt("registered_plugin_channels_limit", pluginChannelLimit);
+         pluginChannelNameLimit = config.getInt("plugin_channel_name_limit", pluginChannelNameLimit);
++
++        // XWaterfall-specific configuration (xwaterfall.yml)
++        XWaterfallConfig xConfig = new XWaterfallConfig(new File(XWaterfallConfig.FILE_NAME));
++        xConfig.load();
++        forwardingMode = ForwardingMode.fromString(xConfig.getString("forwarding_mode", forwardingMode.name()));
++        forwardingSecret = xConfig.getString("forwarding_secret", forwardingSecret);
++        if (isIpForward() && forwardingMode != ForwardingMode.BUNGEECORD_LEGACY && (forwardingSecret == null || forwardingSecret.isEmpty())) {
++            ProxyServer.getInstance().getLogger().log(Level.WARNING, "forwarding_mode is set to {0} but forwarding_secret is empty; backend servers will reject connections", forwardingMode);
++        }
+     }
+ 
+     @Override
+diff --git a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/XWaterfallConfig.java b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/XWaterfallConfig.java
+new file mode 100644
+index 00000000..30c9b356
+--- /dev/null
++++ b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/XWaterfallConfig.java
+@@ -0,0 +1,110 @@
++package io.github.waterfallmc.waterfall.conf;
++
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.nio.file.Files;
++import java.util.Collections;
++import java.util.Map;
++import java.util.logging.Level;
++import net.md_5.bungee.api.ProxyServer;
++import org.yaml.snakeyaml.Yaml;
++import org.yaml.snakeyaml.error.YAMLException;
++
++/**
++ * Loader for {@code xwaterfall.yml}, the XWaterfall-specific configuration file.
++ *
++ * <p>Unlike {@link net.md_5.bungee.conf.YamlConfig} this loader is strictly
++ * read-only: it never rewrites the file, so the comments shipped in the bundled
++ * default are preserved across restarts and version upgrades. When the file is
++ * absent the bundled default (with comments) is copied to disk; any keys missing
++ * from an existing file simply fall back to the supplied code defaults.
++ */
++public class XWaterfallConfig
++{
++
++    /**
++     * Name of both the on-disk file and the bundled classpath resource.
++     */
++    public static final String FILE_NAME = "xwaterfall.yml";
++
++    private final File file;
++    private Map<String, Object> config = Collections.emptyMap();
++
++    public XWaterfallConfig(File file)
++    {
++        this.file = file;
++    }
++
++    @SuppressWarnings("unchecked")
++    public void load()
++    {
++        // Write out the commented default if the file does not exist yet.
++        if ( !file.exists() )
++        {
++            try ( InputStream in = XWaterfallConfig.class.getClassLoader().getResourceAsStream( FILE_NAME ) )
++            {
++                if ( in != null )
++                {
++                    Files.copy( in, file.toPath() );
++                }
++            } catch ( IOException ex )
++            {
++                ProxyServer.getInstance().getLogger().log( Level.WARNING, "Could not write default " + FILE_NAME, ex );
++            }
++        }
++
++        if ( !file.exists() )
++        {
++            return; // Nothing to read; callers will use their defaults.
++        }
++
++        try ( InputStream is = new FileInputStream( file ) )
++        {
++            Map<String, Object> loaded = new Yaml().load( is );
++            if ( loaded != null )
++            {
++                config = loaded;
++            }
++        } catch ( IOException | YAMLException ex )
++        {
++            ProxyServer.getInstance().getLogger().log( Level.WARNING, "Could not load " + FILE_NAME + ", using defaults", ex );
++        }
++    }
++
++    @SuppressWarnings("unchecked")
++    private Object get(String path)
++    {
++        Map<String, Object> map = config;
++        String[] parts = path.split( "\\." );
++        for ( int i = 0; i < parts.length - 1; i++ )
++        {
++            Object sub = map.get( parts[i] );
++            if ( !( sub instanceof Map ) )
++            {
++                return null;
++            }
++            map = (Map<String, Object>) sub;
++        }
++        return map.get( parts[parts.length - 1] );
++    }
++
++    public String getString(String path, String def)
++    {
++        Object val = get( path );
++        return ( val != null ) ? val.toString() : def;
++    }
++
++    public boolean getBoolean(String path, boolean def)
++    {
++        Object val = get( path );
++        return ( val instanceof Boolean ) ? (Boolean) val : def;
++    }
++
++    public int getInt(String path, int def)
++    {
++        Object val = get( path );
++        return ( val instanceof Number ) ? ( (Number) val ).intValue() : def;
++    }
++}
 diff --git a/proxy/src/main/java/net/md_5/bungee/ServerConnector.java b/proxy/src/main/java/net/md_5/bungee/ServerConnector.java
 index 04cd9893..9164795b 100644
 --- a/proxy/src/main/java/net/md_5/bungee/ServerConnector.java
@@ -142,36 +298,33 @@ index 04cd9893..9164795b 100644
      public String toString()
      {
 diff --git a/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java b/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
-index 1f600dab..af1386e0 100644
+index 1f600dab..a9b3c0f4 100644
 --- a/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
 +++ b/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
-@@ -69,6 +69,16 @@ public abstract class Configuration implements ProxyConfig
+@@ -69,6 +69,18 @@ public abstract class Configuration implements ProxyConfig
      private int throttle = 4000;
      private int throttleLimit = 3;
      private boolean ipForward;
 +    /**
 +     * The mechanism used to forward player information to backend servers.
-+     * Only takes effect when {@link #ipForward} is enabled.
++     * Only takes effect when {@link #ipForward} is enabled. Loaded from
++     * xwaterfall.yml by {@code WaterfallConfiguration}.
 +     */
-+    private ForwardingMode forwardingMode = ForwardingMode.BUNGEECORD_LEGACY;
++    protected ForwardingMode forwardingMode = ForwardingMode.BUNGEECORD_LEGACY;
 +    /**
 +     * Shared secret used by the {@link ForwardingMode#BUNGEEGUARD} and
-+     * {@link ForwardingMode#VELOCITY_MODERN} forwarding modes.
++     * {@link ForwardingMode#VELOCITY_MODERN} forwarding modes. Loaded from
++     * xwaterfall.yml by {@code WaterfallConfiguration}.
 +     */
-+    private String forwardingSecret = "";
++    protected String forwardingSecret = "";
      private Favicon favicon;
      private int compressionThreshold = 256;
      private boolean preventProxyConnections;
-@@ -109,6 +119,12 @@ public abstract class Configuration implements ProxyConfig
+@@ -109,6 +121,7 @@ public abstract class Configuration implements ProxyConfig
          throttle = adapter.getInt( "connection_throttle", throttle );
          throttleLimit = adapter.getInt( "connection_throttle_limit", throttleLimit );
          ipForward = adapter.getBoolean( "ip_forward", ipForward );
-+        forwardingMode = ForwardingMode.fromString( adapter.getString( "forwarding_mode", forwardingMode.name() ) );
-+        forwardingSecret = adapter.getString( "forwarding_secret", forwardingSecret );
-+        if ( ipForward && forwardingMode != ForwardingMode.BUNGEECORD_LEGACY && ( forwardingSecret == null || forwardingSecret.isEmpty() ) )
-+        {
-+            ProxyServer.getInstance().getLogger().log( Level.WARNING, "forwarding_mode is set to {0} but forwarding_secret is empty; backend servers will reject connections", forwardingMode );
-+        }
++        // forwardingMode / forwardingSecret are loaded from xwaterfall.yml in WaterfallConfiguration
          compressionThreshold = adapter.getInt( "network_compression_threshold", compressionThreshold );
          preventProxyConnections = adapter.getBoolean( "prevent_proxy_connections", preventProxyConnections );
          forgeSupport = adapter.getBoolean( "forge_support", forgeSupport );
@@ -232,6 +385,49 @@ index 00000000..ee41a321
 +        return BUNGEECORD_LEGACY;
 +    }
 +}
+diff --git a/proxy/src/main/resources/xwaterfall.yml b/proxy/src/main/resources/xwaterfall.yml
+new file mode 100644
+index 00000000..5f8afad8
+--- /dev/null
++++ b/proxy/src/main/resources/xwaterfall.yml
+@@ -0,0 +1,37 @@
++# ===========================================================================
++#  XWaterfall configuration
++# ---------------------------------------------------------------------------
++#  Settings specific to the XWaterfall fork. After editing, run the proxy
++#  command "reload" or restart the proxy for changes to take effect.
++#
++#  Note: keys that are missing from this file fall back to their built-in
++#  defaults, so it is safe to delete options you do not want to change.
++# ===========================================================================
++
++# ---------------------------------------------------------------------------
++#  Player info forwarding
++# ---------------------------------------------------------------------------
++# How player information (uuid, properties, ip address) is forwarded to the
++# backend servers. This only takes effect when "ip_forward" is enabled in
++# config.yml.
++#
++# Available modes:
++# - "BUNGEECORD_LEGACY": The proxy only sends uuid, properties and ip address.
++#                        Outdated and not secure, use it only if you are
++#                        absolutely sure that your backend servers cannot be
++#                        reached from the outside.
++# - "BUNGEEGUARD":       The proxy sends a secret along with the uuid, properties
++#                        and ip address, which is compared on the server.
++#                        This method is preferable and works on all versions of
++#                        the game.
++# - "VELOCITY_MODERN":   The proxy sends signed uuid, properties and ip address
++#                        data. This method is the most preferable, but it only
++#                        works on 1.13+ backend servers.
++forwarding_mode: BUNGEECORD_LEGACY
++
++# The secret key used for the BUNGEEGUARD and VELOCITY_MODERN forwarding modes.
++# - For VELOCITY_MODERN it must match the forwarding secret configured on the
++#   backend server (e.g. Paper's config/paper-global.yml -> proxies.velocity.secret).
++# - For BUNGEEGUARD it must match the token configured in the BungeeGuard plugin.
++# Keep it long and random. Ignored when forwarding_mode is BUNGEECORD_LEGACY.
++forwarding_secret: ''
 -- 
 2.50.1 (Apple Git-155)
 
