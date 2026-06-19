@@ -1,0 +1,162 @@
+From c6fd72bc33d7e749adbd08d288e9eae7019e7367 Mon Sep 17 00:00:00 2001
+From: regksem <regksem@tuta.io>
+Date: Fri, 19 Jun 2026 22:00:27 +0300
+Subject: [PATCH] Add anti-bot liveness check (patch 0078)
+
+Under attack, a freshly joined connection must send its ClientSettings within
+antibot.liveness.timeout-ms (every real client sends them on join) or it is
+disconnected. Scheduled on the connection's event loop right after the upstream
+bridge is installed; opt-in via antibot.liveness.enabled, with its own cached
+message. Only engages while under attack to limit false positives.
+
+diff --git a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
+index fc734202..47ffb187 100644
+--- a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
++++ b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
+@@ -150,11 +150,15 @@ public class WaterfallConfiguration extends Configuration {
+         net.regksem.xwaterfall.antibot.AntiBot.setMaxConnectionsPerIp(xConfig.getInt("antibot.max-connections-per-ip", 0));
+         net.regksem.xwaterfall.antibot.AntiBot.setBlockDirectIp(xConfig.getBoolean("antibot.block-direct-ip", true));
+         net.regksem.xwaterfall.antibot.AntiBot.setNamePattern(xConfig.getString("antibot.name-pattern", ""));
++        net.regksem.xwaterfall.antibot.AntiBot.setLiveness(
++                xConfig.getBoolean("antibot.liveness.enabled", false),
++                xConfig.getInt("antibot.liveness.timeout-ms", 5000));
+         net.regksem.xwaterfall.antibot.AntiBot.setMessages(
+                 xConfig.getString("antibot.messages.reconnect", null),
+                 xConfig.getString("antibot.messages.name", null),
+                 xConfig.getString("antibot.messages.direct-ip", null),
+-                xConfig.getString("antibot.messages.ip-limit", null));
++                xConfig.getString("antibot.messages.ip-limit", null),
++                xConfig.getString("antibot.messages.liveness", null));
+     }
+ 
+     /**
+diff --git a/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java b/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java
+index f060014f..458198f2 100644
+--- a/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java
++++ b/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java
+@@ -729,6 +729,19 @@ public class InitialHandler extends PacketHandler implements PendingConnection
+ 
+         ch.getHandle().pipeline().get( HandlerBoss.class ).setHandler( new UpstreamBridge( bungee, userCon ) );
+ 
++        // XWaterfall - anti-bot liveness: under attack, require ClientSettings within the deadline
++        if ( net.regksem.xwaterfall.antibot.AntiBot.shouldCheckLiveness() )
++        {
++            final UserConnection livenessUser = userCon;
++            ch.getHandle().eventLoop().schedule( () ->
++            {
++                if ( livenessUser.isConnected() && livenessUser.getSettings() == null )
++                {
++                    livenessUser.disconnect( net.regksem.xwaterfall.antibot.AntiBot.livenessMessage() );
++                }
++            }, net.regksem.xwaterfall.antibot.AntiBot.livenessTimeoutMs(), java.util.concurrent.TimeUnit.MILLISECONDS );
++        }
++
+         ServerInfo initialServer;
+         if ( bungee.getReconnectHandler() != null )
+         {
+diff --git a/proxy/src/main/java/net/regksem/xwaterfall/antibot/AntiBot.java b/proxy/src/main/java/net/regksem/xwaterfall/antibot/AntiBot.java
+index 9b5d1376..08e9394c 100644
+--- a/proxy/src/main/java/net/regksem/xwaterfall/antibot/AntiBot.java
++++ b/proxy/src/main/java/net/regksem/xwaterfall/antibot/AntiBot.java
+@@ -37,6 +37,8 @@ public final class AntiBot
+     private static volatile int maxConnectionsPerIp = 0; // 0 = disabled
+     private static volatile boolean blockDirectIp = true; // only enforced under attack
+     private static volatile Pattern namePattern = null; // null = accept any name
++    private static volatile boolean livenessEnabled = false; // require ClientSettings under attack
++    private static volatile long livenessTimeoutMs = 5000L;
+ 
+     // Messages are pre-rendered into chat components once at (re)load, so the
+     // colour pipeline never runs on the hot login path.
+@@ -44,6 +46,7 @@ public final class AntiBot
+     private static volatile BaseComponent msgName = MotdManager.renderComponent( "&cYour username is not allowed on this server." );
+     private static volatile BaseComponent msgDirectIp = MotdManager.renderComponent( "&cPlease connect using the server address, not its IP." );
+     private static volatile BaseComponent msgIpLimit = MotdManager.renderComponent( "&cToo many connections from your IP address." );
++    private static volatile BaseComponent msgLiveness = MotdManager.renderComponent( "&cConnection verification failed, please reconnect." );
+ 
+     // ---- rolling join-rate counter (1s buckets) ----
+     private static volatile long currentSecond = 0L;
+@@ -204,6 +207,24 @@ public final class AntiBot
+         return msgDirectIp;
+     }
+ 
++    // ---- liveness (require ClientSettings shortly after joining, under attack) ----
++
++    /** Whether a freshly joined connection should be put under a liveness deadline. */
++    public static boolean shouldCheckLiveness()
++    {
++        return enabled && livenessEnabled && isUnderAttack();
++    }
++
++    public static long livenessTimeoutMs()
++    {
++        return livenessTimeoutMs;
++    }
++
++    public static BaseComponent livenessMessage()
++    {
++        return msgLiveness;
++    }
++
+     // ---- per-IP connection accounting (called from BungeeCord add/remove) ----
+ 
+     public static void onConnectionOpened(SocketAddress address)
+@@ -301,6 +322,12 @@ public final class AntiBot
+         blockDirectIp = value;
+     }
+ 
++    public static void setLiveness(boolean enabledValue, long timeoutMs)
++    {
++        livenessEnabled = enabledValue;
++        livenessTimeoutMs = Math.max( 1000L, timeoutMs );
++    }
++
+     public static void setNamePattern(String regex)
+     {
+         if ( regex == null || regex.isEmpty() )
+@@ -322,7 +349,7 @@ public final class AntiBot
+      * (full MiniMessage / legacy / hex support). A null leaves the current
+      * value (i.e. the built-in default) in place.
+      */
+-    public static void setMessages(String reconnect, String name, String directIp, String ipLimit)
++    public static void setMessages(String reconnect, String name, String directIp, String ipLimit, String liveness)
+     {
+         if ( reconnect != null )
+         {
+@@ -340,5 +367,9 @@ public final class AntiBot
+         {
+             msgIpLimit = MotdManager.renderComponent( ipLimit );
+         }
++        if ( liveness != null )
++        {
++            msgLiveness = MotdManager.renderComponent( liveness );
++        }
+     }
+ }
+diff --git a/proxy/src/main/resources/xwaterfall.yml b/proxy/src/main/resources/xwaterfall.yml
+index d6fc2d7d..0640b3bd 100644
+--- a/proxy/src/main/resources/xwaterfall.yml
++++ b/proxy/src/main/resources/xwaterfall.yml
+@@ -235,6 +235,15 @@ antibot:
+   # vanilla-style names. Empty means accept any (valid) username.
+   name-pattern: ""
+ 
++  # Liveness check: while under attack, a freshly joined connection must send its
++  # ClientSettings (locale / view distance, which every real client sends on
++  # join) within the timeout, or it is disconnected. Catches bots that connect
++  # but never behave like a client. Only runs under attack, but note exotic
++  # modded clients could in theory be slow to send settings.
++  liveness:
++    enabled: false
++    timeout-ms: 5000
++
+   # Kick messages. Each supports the full colour pipeline (auto-detected):
+   # MiniMessage (RGB, <gradient>, <#hex>) by default, or legacy '&' / section
+   # codes incl. hex when those are present. Use {NL} for a new line. Messages are
+@@ -245,3 +254,4 @@ antibot:
+     name: "<red>Your username is not allowed on this server."
+     direct-ip: "<red>Please connect using the server address, not its IP."
+     ip-limit: "<red>Too many connections from your IP address."
++    liveness: "<red>Connection verification failed, please reconnect."
+-- 
+2.50.1 (Apple Git-155)
+
