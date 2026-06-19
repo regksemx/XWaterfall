@@ -1,0 +1,237 @@
+From 2935319b41cd455392c73924e278541aca8c9406 Mon Sep 17 00:00:00 2001
+From: regksem <regksem@tuta.io>
+Date: Fri, 19 Jun 2026 18:23:15 +0300
+Subject: [PATCH] Add configurable forwarding mode (legacy, BungeeGuard,
+ Velocity modern)
+
+Adds a forwarding_mode + forwarding_secret option selecting how player
+information is forwarded to backend servers when ip_forward is enabled:
+
+- BUNGEECORD_LEGACY (default): unchanged classic BungeeCord forwarding.
+- BUNGEEGUARD: appends the shared secret as a bungeeguard-token property.
+- VELOCITY_MODERN: answers the velocity:player_info login plugin request
+  with HMAC-SHA256 signed forwarding data (keyless v1).
+
+diff --git a/proxy/src/main/java/net/md_5/bungee/ServerConnector.java b/proxy/src/main/java/net/md_5/bungee/ServerConnector.java
+index 04cd9893..9164795b 100644
+--- a/proxy/src/main/java/net/md_5/bungee/ServerConnector.java
++++ b/proxy/src/main/java/net/md_5/bungee/ServerConnector.java
+@@ -4,10 +4,13 @@ import com.google.common.base.Joiner;
+ import com.google.common.base.Preconditions;
+ import io.netty.buffer.ByteBuf;
+ import io.netty.buffer.ByteBufAllocator;
++import io.netty.buffer.Unpooled;
+ import java.net.InetSocketAddress;
+ import java.nio.charset.StandardCharsets;
+ import java.util.Locale;
+ import java.util.Arrays; // Waterfall
++import javax.crypto.Mac; // XWaterfall - modern forwarding
++import javax.crypto.spec.SecretKeySpec; // XWaterfall - modern forwarding
+ import java.util.Queue;
+ import java.util.Set;
+ import java.util.UUID;
+@@ -26,6 +29,7 @@ import net.md_5.bungee.api.score.Objective;
+ import net.md_5.bungee.api.score.Score;
+ import net.md_5.bungee.api.score.Scoreboard;
+ import net.md_5.bungee.api.score.Team;
++import net.md_5.bungee.conf.ForwardingMode; // XWaterfall - modern forwarding
+ import net.md_5.bungee.connection.CancelSendSignal;
+ import net.md_5.bungee.connection.DownstreamBridge;
+ import net.md_5.bungee.connection.LoginResult;
+@@ -112,7 +116,10 @@ public class ServerConnector extends PacketHandler
+         Handshake originalHandshake = user.getPendingConnection().getHandshake();
+         Handshake copiedHandshake = new Handshake( originalHandshake.getProtocolVersion(), originalHandshake.getHost(), originalHandshake.getPort(), 2 );
+ 
+-        if ( BungeeCord.getInstance().config.isIpForward() && user.getSocketAddress() instanceof InetSocketAddress )
++        // XWaterfall start - configurable forwarding mode. VELOCITY_MODERN does not inject
++        // anything into the handshake; it answers a velocity:player_info login plugin request instead.
++        ForwardingMode forwardingMode = BungeeCord.getInstance().config.getForwardingMode();
++        if ( BungeeCord.getInstance().config.isIpForward() && forwardingMode != ForwardingMode.VELOCITY_MODERN && user.getSocketAddress() instanceof InetSocketAddress )
+         {
+             String newHost = copiedHandshake.getHost() + "\00" + AddressUtil.sanitizeAddress( user.getAddress() ) + "\00" + user.getUUID();
+ 
+@@ -142,6 +149,15 @@ public class ServerConnector extends PacketHandler
+                 properties = newp;
+             }
+ 
++            // XWaterfall start - BungeeGuard: append the shared secret as a token property
++            if ( forwardingMode == ForwardingMode.BUNGEEGUARD )
++            {
++                net.md_5.bungee.protocol.data.Property[] newp = Arrays.copyOf( properties, properties.length + 1 );
++                newp[newp.length - 1] = new net.md_5.bungee.protocol.data.Property( "bungeeguard-token", BungeeCord.getInstance().config.getForwardingSecret(), null );
++                properties = newp;
++            }
++            // XWaterfall end
++
+             // If we touched any properties, then append them
+             if (properties.length > 0) {
+                 newHost += "\00" + LoginResult.GSON.toJson(properties);
+@@ -149,6 +165,11 @@ public class ServerConnector extends PacketHandler
+             // Waterfall end - properties
+ 
+             copiedHandshake.setHost( newHost );
++        } else if ( BungeeCord.getInstance().config.isIpForward() && forwardingMode == ForwardingMode.VELOCITY_MODERN
++                && !user.getExtraDataInHandshake().isEmpty() )
++        {
++            // XWaterfall - modern forwarding keeps a clean host; only restore client extra data (e.g. FML token)
++            copiedHandshake.setHost( copiedHandshake.getHost() + user.getExtraDataInHandshake() );
+         } else if ( !user.getExtraDataInHandshake().isEmpty() )
+         {
+             // Restore the extra data
+@@ -558,12 +579,62 @@ public class ServerConnector extends PacketHandler
+         user.unsafe().sendPacket( pluginMessage );
+     }
+ 
++    // XWaterfall start - Velocity modern forwarding
++    private static final String VELOCITY_PLAYER_INFO_CHANNEL = "velocity:player_info";
++    private static final int MODERN_FORWARDING_DEFAULT = 1;
++
+     @Override
+     public void handle(LoginPayloadRequest loginPayloadRequest)
+     {
++        if ( BungeeCord.getInstance().config.isIpForward()
++                && BungeeCord.getInstance().config.getForwardingMode() == ForwardingMode.VELOCITY_MODERN
++                && VELOCITY_PLAYER_INFO_CHANNEL.equals( loginPayloadRequest.getChannel() ) )
++        {
++            ch.write( new LoginPayloadResponse( loginPayloadRequest.getId(), createVelocityForwardingData( loginPayloadRequest.getData() ) ) );
++            return;
++        }
+         ch.write( new LoginPayloadResponse( loginPayloadRequest.getId(), null ) );
+     }
+ 
++    private byte[] createVelocityForwardingData(byte[] requestData)
++    {
++        ByteBuf buf = Unpooled.buffer();
++        try
++        {
++            int requestedVersion = ( requestData != null && requestData.length >= 1 ) ? requestData[0] : MODERN_FORWARDING_DEFAULT;
++            // We only implement the keyless version 1 payload, which every backend accepts for players without a chat key.
++            int version = Math.min( requestedVersion, MODERN_FORWARDING_DEFAULT );
++
++            DefinedPacket.writeVarInt( version, buf );
++            DefinedPacket.writeString( AddressUtil.sanitizeAddress( user.getAddress() ), buf );
++            DefinedPacket.writeUUID( user.getUniqueId(), buf );
++            DefinedPacket.writeString( user.getName(), buf );
++
++            LoginResult profile = user.getPendingConnection().getLoginProfile();
++            DefinedPacket.writeProperties( ( profile != null ) ? profile.getProperties() : null, buf );
++
++            byte[] data = new byte[ buf.readableBytes() ];
++            buf.getBytes( buf.readerIndex(), data );
++
++            byte[] secret = BungeeCord.getInstance().config.getForwardingSecret().getBytes( StandardCharsets.UTF_8 );
++            Mac mac = Mac.getInstance( "HmacSHA256" );
++            mac.init( new SecretKeySpec( secret, "HmacSHA256" ) );
++            byte[] signature = mac.doFinal( data );
++
++            byte[] result = new byte[ signature.length + data.length ];
++            System.arraycopy( signature, 0, result, 0, signature.length );
++            System.arraycopy( data, 0, result, signature.length, data.length );
++            return result;
++        } catch ( Exception ex )
++        {
++            throw new RuntimeException( "Unable to create Velocity modern forwarding data", ex );
++        } finally
++        {
++            buf.release();
++        }
++    }
++    // XWaterfall end
++
+     @Override
+     public String toString()
+     {
+diff --git a/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java b/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
+index 1f600dab..af1386e0 100644
+--- a/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
++++ b/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
+@@ -69,6 +69,16 @@ public abstract class Configuration implements ProxyConfig
+     private int throttle = 4000;
+     private int throttleLimit = 3;
+     private boolean ipForward;
++    /**
++     * The mechanism used to forward player information to backend servers.
++     * Only takes effect when {@link #ipForward} is enabled.
++     */
++    private ForwardingMode forwardingMode = ForwardingMode.BUNGEECORD_LEGACY;
++    /**
++     * Shared secret used by the {@link ForwardingMode#BUNGEEGUARD} and
++     * {@link ForwardingMode#VELOCITY_MODERN} forwarding modes.
++     */
++    private String forwardingSecret = "";
+     private Favicon favicon;
+     private int compressionThreshold = 256;
+     private boolean preventProxyConnections;
+@@ -109,6 +119,12 @@ public abstract class Configuration implements ProxyConfig
+         throttle = adapter.getInt( "connection_throttle", throttle );
+         throttleLimit = adapter.getInt( "connection_throttle_limit", throttleLimit );
+         ipForward = adapter.getBoolean( "ip_forward", ipForward );
++        forwardingMode = ForwardingMode.fromString( adapter.getString( "forwarding_mode", forwardingMode.name() ) );
++        forwardingSecret = adapter.getString( "forwarding_secret", forwardingSecret );
++        if ( ipForward && forwardingMode != ForwardingMode.BUNGEECORD_LEGACY && ( forwardingSecret == null || forwardingSecret.isEmpty() ) )
++        {
++            ProxyServer.getInstance().getLogger().log( Level.WARNING, "forwarding_mode is set to {0} but forwarding_secret is empty; backend servers will reject connections", forwardingMode );
++        }
+         compressionThreshold = adapter.getInt( "network_compression_threshold", compressionThreshold );
+         preventProxyConnections = adapter.getBoolean( "prevent_proxy_connections", preventProxyConnections );
+         forgeSupport = adapter.getBoolean( "forge_support", forgeSupport );
+diff --git a/proxy/src/main/java/net/md_5/bungee/conf/ForwardingMode.java b/proxy/src/main/java/net/md_5/bungee/conf/ForwardingMode.java
+new file mode 100644
+index 00000000..ee41a321
+--- /dev/null
++++ b/proxy/src/main/java/net/md_5/bungee/conf/ForwardingMode.java
+@@ -0,0 +1,51 @@
++package net.md_5.bungee.conf;
++
++/**
++ * The way the proxy forwards player information (ip, uuid, properties) to the
++ * backend servers.
++ */
++public enum ForwardingMode
++{
++
++    /**
++     * The proxy only sends uuid, properties and ip address. This is the classic
++     * BungeeCord forwarding format. Outdated and not secure: only use it if you
++     * are absolutely sure your backend servers cannot be reached from the
++     * outside.
++     */
++    BUNGEECORD_LEGACY,
++    /**
++     * The proxy sends a secret along with the uuid, properties and ip address,
++     * which is compared on the server by the BungeeGuard plugin. Works on all
++     * versions of the game.
++     */
++    BUNGEEGUARD,
++    /**
++     * The proxy sends signed uuid, properties and ip address data using the
++     * Velocity modern forwarding scheme. The most preferable method, but it only
++     * works on 1.13+ backend servers.
++     */
++    VELOCITY_MODERN;
++
++    /**
++     * Parses a forwarding mode from a configuration string, falling back to
++     * {@link #BUNGEECORD_LEGACY} when the value is missing or unrecognised.
++     *
++     * @param value the configured value
++     * @return the matching mode, never null
++     */
++    public static ForwardingMode fromString(String value)
++    {
++        if ( value != null )
++        {
++            for ( ForwardingMode mode : values() )
++            {
++                if ( mode.name().equalsIgnoreCase( value.trim() ) )
++                {
++                    return mode;
++                }
++            }
++        }
++        return BUNGEECORD_LEGACY;
++    }
++}
+-- 
+2.50.1 (Apple Git-155)
+
