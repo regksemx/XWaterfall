@@ -1,0 +1,303 @@
+From 442285ce0a3ab0241039eb35963163bda3bd0477 Mon Sep 17 00:00:00 2001
+From: regksem <regksem@tuta.io>
+Date: Fri, 19 Jun 2026 22:07:30 +0300
+Subject: [PATCH] Allow overriding built-in translations via xwaterfall.yml
+ messages: (patch 0079)
+
+A new messages: section maps any BungeeCord translation key (proxy_full,
+outdated_client, name_invalid, ...) to a template rendered through the shared
+MiniMessage / legacy / hex pipeline. Overrides are rendered once into cached
+MessageFormats and overlaid in BungeeCord.reloadMessages after the defaults,
+preserving positional args. Reloadable via /xwaterfall messages reload, and a
+new /xwaterfall reload refreshes motd + anti-bot + messages together.
+
+diff --git a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
+index 47ffb187..29717120 100644
+--- a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
++++ b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
+@@ -123,6 +123,28 @@ public class WaterfallConfiguration extends Configuration {
+ 
+         // Anti-bot
+         applyAntiBot(xConfig);
++
++        // Message overrides for built-in translations
++        applyMessageOverrides(xConfig);
++    }
++
++    /**
++     * Loads the {@code messages:} overrides and rebuilds the translation table so
++     * they take effect (and are re-rendered through the colour pipeline).
++     */
++    private void applyMessageOverrides(XWaterfallConfig xConfig) {
++        net.regksem.xwaterfall.message.MessageOverrides.load(xConfig.getStringMap("messages"));
++        net.md_5.bungee.BungeeCord.getInstance().reloadMessages();
++    }
++
++    /**
++     * Re-reads only the {@code messages:} section and rebuilds the translation
++     * table. Backs {@code /xwaterfall messages reload}.
++     */
++    public void reloadMessageOverrides() {
++        XWaterfallConfig xConfig = new XWaterfallConfig(new File(XWaterfallConfig.FILE_NAME));
++        xConfig.load();
++        applyMessageOverrides(xConfig);
+     }
+ 
+     /**
+diff --git a/proxy/src/main/java/net/md_5/bungee/BungeeCord.java b/proxy/src/main/java/net/md_5/bungee/BungeeCord.java
+index 7ca239dd..35a8ddeb 100644
+--- a/proxy/src/main/java/net/md_5/bungee/BungeeCord.java
++++ b/proxy/src/main/java/net/md_5/bungee/BungeeCord.java
+@@ -582,6 +582,8 @@ public class BungeeCord extends ProxyServer
+         }
+         cacheResourceBundle( cachedFormats, baseBundle );
+ 
++        net.regksem.xwaterfall.message.MessageOverrides.apply( cachedFormats ); // XWaterfall - xwaterfall.yml message overrides (coloured)
++
+         messageFormats = Collections.unmodifiableMap( cachedFormats );
+     }
+ 
+diff --git a/proxy/src/main/java/net/regksem/xwaterfall/command/CommandXWaterfall.java b/proxy/src/main/java/net/regksem/xwaterfall/command/CommandXWaterfall.java
+index 224b263a..59e5b551 100644
+--- a/proxy/src/main/java/net/regksem/xwaterfall/command/CommandXWaterfall.java
++++ b/proxy/src/main/java/net/regksem/xwaterfall/command/CommandXWaterfall.java
+@@ -24,16 +24,27 @@ public class CommandXWaterfall extends Command
+     @Override
+     public void execute(CommandSender sender, String[] args)
+     {
+-        if ( args.length == 2 && args[1].equalsIgnoreCase( "reload" ) )
++        Configuration config = BungeeCord.getInstance().config;
++        if ( !( config instanceof WaterfallConfiguration ) )
+         {
+-            Configuration config = BungeeCord.getInstance().config;
+-            if ( !( config instanceof WaterfallConfiguration ) )
+-            {
+-                sender.sendMessage( ChatColor.RED + "Reloading is unavailable on this configuration." );
+-                return;
+-            }
+-            WaterfallConfiguration xConfig = (WaterfallConfiguration) config;
++            sender.sendMessage( ChatColor.RED + "Reloading is unavailable on this configuration." );
++            return;
++        }
++        WaterfallConfiguration xConfig = (WaterfallConfiguration) config;
+ 
++        // /xwaterfall reload - reload everything
++        if ( args.length == 1 && args[0].equalsIgnoreCase( "reload" ) )
++        {
++            xConfig.reloadMotd();
++            xConfig.reloadAntiBot();
++            xConfig.reloadMessageOverrides();
++            sender.sendMessage( ChatColor.GREEN + "Reloaded MOTD, anti-bot and message overrides from xwaterfall.yml." );
++            return;
++        }
++
++        // /xwaterfall <motd|antibot|messages> reload
++        if ( args.length == 2 && args[1].equalsIgnoreCase( "reload" ) )
++        {
+             if ( args[0].equalsIgnoreCase( "motd" ) )
+             {
+                 xConfig.reloadMotd();
+@@ -46,8 +57,14 @@ public class CommandXWaterfall extends Command
+                 sender.sendMessage( ChatColor.GREEN + "Anti-bot settings and messages reloaded from xwaterfall.yml." );
+                 return;
+             }
++            if ( args[0].equalsIgnoreCase( "messages" ) )
++            {
++                xConfig.reloadMessageOverrides();
++                sender.sendMessage( ChatColor.GREEN + "Message overrides reloaded from xwaterfall.yml." );
++                return;
++            }
+         }
+ 
+-        sender.sendMessage( ChatColor.RED + "Usage: /xwaterfall <motd|antibot> reload" );
++        sender.sendMessage( ChatColor.RED + "Usage: /xwaterfall [<motd|antibot|messages>] reload" );
+     }
+ }
+diff --git a/proxy/src/main/java/net/regksem/xwaterfall/conf/XWaterfallConfig.java b/proxy/src/main/java/net/regksem/xwaterfall/conf/XWaterfallConfig.java
+index 41a4007e..c9011b23 100644
+--- a/proxy/src/main/java/net/regksem/xwaterfall/conf/XWaterfallConfig.java
++++ b/proxy/src/main/java/net/regksem/xwaterfall/conf/XWaterfallConfig.java
+@@ -135,4 +135,27 @@ public class XWaterfallConfig
+         }
+         return result;
+     }
++
++    /**
++     * Reads a flat mapping at the given path as string -&gt; string. Returns an
++     * empty map when the key is missing or not a mapping. Keys and values are
++     * coerced to strings; null values are skipped.
++     */
++    public java.util.Map<String, String> getStringMap(String path)
++    {
++        Object val = get( path );
++        if ( !( val instanceof java.util.Map ) )
++        {
++            return java.util.Collections.emptyMap();
++        }
++        java.util.Map<String, String> result = new java.util.LinkedHashMap<>();
++        for ( java.util.Map.Entry<?, ?> entry : ( (java.util.Map<?, ?>) val ).entrySet() )
++        {
++            if ( entry.getKey() != null && entry.getValue() != null )
++            {
++                result.put( entry.getKey().toString(), entry.getValue().toString() );
++            }
++        }
++        return result;
++    }
+ }
+diff --git a/proxy/src/main/java/net/regksem/xwaterfall/message/MessageOverrides.java b/proxy/src/main/java/net/regksem/xwaterfall/message/MessageOverrides.java
+new file mode 100644
+index 00000000..77b060d5
+--- /dev/null
++++ b/proxy/src/main/java/net/regksem/xwaterfall/message/MessageOverrides.java
+@@ -0,0 +1,73 @@
++package net.regksem.xwaterfall.message;
++
++import java.text.Format;
++import java.text.MessageFormat;
++import java.util.Collections;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import java.util.logging.Level;
++import net.md_5.bungee.api.ProxyServer;
++import net.md_5.bungee.api.chat.BaseComponent;
++import net.regksem.xwaterfall.motd.MotdManager;
++
++/**
++ * Lets {@code xwaterfall.yml} override the built-in BungeeCord translation
++ * messages (the keys in {@code messages.properties}: {@code proxy_full},
++ * {@code outdated_client}, {@code name_invalid}, ...) and render them through the
++ * shared MiniMessage / legacy / hex pipeline.
++ *
++ * <p>Each override is rendered once into a legacy-section string and stored as a
++ * {@link MessageFormat}, so the colour parse happens at (re)load time, not per
++ * lookup. Positional arguments such as {@code {0}} are preserved and substituted
++ * by {@code getTranslation} exactly like the stock messages. The rendered string
++ * round-trips back into a coloured component wherever the translation is shown
++ * via {@code fromLegacy} (kick screens, etc.).
++ */
++public final class MessageOverrides
++{
++
++    private MessageOverrides()
++    {
++    }
++
++    private static volatile Map<String, String> templates = Collections.emptyMap();
++
++    /** Loads the raw key -&gt; template map (typically the {@code messages:} section). */
++    public static void load(Map<String, String> raw)
++    {
++        Map<String, String> copy = new LinkedHashMap<>();
++        if ( raw != null )
++        {
++            for ( Map.Entry<String, String> entry : raw.entrySet() )
++            {
++                if ( entry.getKey() != null && entry.getValue() != null && !entry.getValue().isEmpty() )
++                {
++                    copy.put( entry.getKey(), entry.getValue() );
++                }
++            }
++        }
++        templates = copy;
++    }
++
++    /**
++     * Overlays the loaded overrides onto a translation format map (called from
++     * {@code BungeeCord.reloadMessages} after the defaults are populated). A
++     * template that fails to render or compile is skipped so the stock message
++     * stays in place.
++     */
++    public static void apply(Map<String, Format> formats)
++    {
++        for ( Map.Entry<String, String> entry : templates.entrySet() )
++        {
++            try
++            {
++                BaseComponent component = MotdManager.renderComponent( entry.getValue() );
++                formats.put( entry.getKey(), new MessageFormat( component.toLegacyText() ) );
++            } catch ( RuntimeException ex )
++            {
++                ProxyServer.getInstance().getLogger().log( Level.WARNING,
++                        "Skipping invalid message override for '" + entry.getKey() + "'", ex );
++            }
++        }
++    }
++}
+diff --git a/proxy/src/main/resources/xwaterfall.yml b/proxy/src/main/resources/xwaterfall.yml
+index 0640b3bd..c36a6fb3 100644
+--- a/proxy/src/main/resources/xwaterfall.yml
++++ b/proxy/src/main/resources/xwaterfall.yml
+@@ -255,3 +255,69 @@ antibot:
+     direct-ip: "<red>Please connect using the server address, not its IP."
+     ip-limit: "<red>Too many connections from your IP address."
+     liveness: "<red>Connection verification failed, please reconnect."
++
++# ---------------------------------------------------------------------------
++#  Message overrides (built-in translations)
++# ---------------------------------------------------------------------------
++# Override any built-in BungeeCord message (the keys from messages.properties)
++# and render it through the full colour pipeline: MiniMessage (RGB, <gradient>,
++# <#hex>) by default, or legacy '&' / section codes incl. hex. Use {NL} for a
++# new line. Overrides are rendered and cached on startup; run
++# "/xwaterfall messages reload" (or "/xwaterfall reload" for everything) to
++# re-read them.
++#
++# Keep positional placeholders like {0} where the original has them. Because
++# these go through java.text.MessageFormat, a literal single quote must be
++# doubled ('') just like in messages.properties.
++#
++# Common keys: proxy_full, outdated_client {0}, outdated_server {0},
++# name_invalid, already_connected_proxy, lost_connection, server_went_down,
++# kick_message, reject_transfer. Leave the section empty to change nothing.
++# Every built-in key is listed below with its default text so you can edit any
++# of them in place. Delete a line to fall back to the built-in default.
++messages:
++  alert: "&8[&4Alert&8]&r "
++  already_connected: "&cYou are already connected to this server!"
++  already_connected_proxy: "&cYou are already connected to this proxy!"
++  already_connecting: "&cAlready connecting to this server!"
++  command_list: "&a[{0}] &e({1}): &r{2}"
++  connect_kick: "&cKicked whilst connecting to {0}: {1}"
++  current_server: "&6You are currently connected to {0}."
++  fallback_kick: "&cCould not connect to a default or fallback server. Incorrectly configured address/port/firewall? {0}"
++  fallback_lobby: "&cCould not connect to target server, you have been moved to a fallback server."
++  lost_connection: "&cProxy lost connection to server."
++  mojang_fail: "&cError occurred while contacting login servers, are they down?"
++  no_permission: "&cYou do not have permission to execute this command!"
++  no_server: "&cThe specified server does not exist."
++  no_server_permission: "&cYou don''t have permission to access this server."
++  outdated_client: "&cOutdated client! Please use {0}"
++  outdated_server: "&cOutdated server! I''m still on {0}"
++  proxy_full: "&cServer is full!"
++  restart: "&cThe proxy server is restarting"
++  server_list: "&6You may connect to the following servers at this time: "
++  server_went_down: "&cThe server you were previously on went down, you have been connected to a fallback server"
++  total_players: "Total players online: {0}"
++  name_invalid: "&cUsername contains invalid characters."
++  ping_cannot_connect: "&cCould not request status from target server."
++  offline_mode_player: "&cNot authenticated with Minecraft.net"
++  secure_profile_required: "&cA secure profile is required to join this server."
++  secure_profile_expired: "&cSecure profile expired."
++  secure_profile_invalid: "&cSecure profile invalid."
++  secure_profile_unsupported: "&cOutdated client, secure profile not supported. Please use 1.19 or newer."
++  message_needed: "&cYou must supply a message."
++  error_occurred_player: "&cAn error occurred while parsing your message. (Hover for details)"
++  error_occurred_console: "&cAn error occurred while parsing your message: {0}"
++  click_to_connect: "Click to connect to the server"
++  username_needed: "&cPlease follow this command by a username."
++  user_not_online: "&cThat user is not online."
++  user_online_at: "&a{0} &ris online at {1}"
++  send_cmd_usage: "&cNot enough arguments, usage: /send <server|player|all|current> <target>"
++  player_only: "&cOnly in game players can use this command"
++  you_got_summoned: "&6Summoned to {0} by {1}"
++  command_perms_groups: "&6You have the following groups: {0}"
++  command_perms_permission: "&9- {0}"
++  command_ip: "&9IP of {0} is {1}"
++  illegal_chat_characters: "&cIllegal characters in chat ({0})"
++  kick_message: "&cYou have been kicked off the proxy."
++  reject_transfer: "&cYour transfer was rejected."
++  packet_limit_kick: "&cYou have sent too many packets"
+-- 
+2.50.1 (Apple Git-155)
+
