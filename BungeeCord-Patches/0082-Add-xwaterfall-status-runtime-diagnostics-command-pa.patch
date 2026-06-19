@@ -1,0 +1,227 @@
+From e0949dd2637dcd3291649517e55a22f3de1a4460 Mon Sep 17 00:00:00 2001
+From: regksem <regksem@tuta.io>
+Date: Fri, 19 Jun 2026 23:48:43 +0300
+Subject: [PATCH] Add /xwaterfall status runtime diagnostics command (patch
+ 0082)
+
+
+diff --git a/proxy/src/main/java/net/regksem/xwaterfall/antibot/AntiBot.java b/proxy/src/main/java/net/regksem/xwaterfall/antibot/AntiBot.java
+index 08e9394c..d8eda792 100644
+--- a/proxy/src/main/java/net/regksem/xwaterfall/antibot/AntiBot.java
++++ b/proxy/src/main/java/net/regksem/xwaterfall/antibot/AntiBot.java
+@@ -108,6 +108,59 @@ public final class AntiBot
+         return recent >= attackJoinsPerSecond;
+     }
+ 
++    // ---- diagnostics (surfaced by /xwaterfall status) ----
++
++    /** @return logins observed in the current or previous second. */
++    public static int recentJoinsPerSecond()
++    {
++        long second = System.currentTimeMillis() / 1000L;
++        return ( second - currentSecond <= 1L ) ? Math.max( lastSecondCount, currentCount.get() ) : 0;
++    }
++
++    /** @return the configured attack threshold (joins/sec), or -1 if disabled. */
++    public static int attackJoinsPerSecond()
++    {
++        return attackJoinsPerSecond;
++    }
++
++    public static int maxConnectionsPerIp()
++    {
++        return maxConnectionsPerIp;
++    }
++
++    public static boolean blockDirectIp()
++    {
++        return blockDirectIp;
++    }
++
++    public static boolean livenessEnabled()
++    {
++        return livenessEnabled;
++    }
++
++    public static boolean hasNamePattern()
++    {
++        return namePattern != null;
++    }
++
++    /** Number of currently trusted (verified) IPs. */
++    public static int verifiedCount()
++    {
++        return verified.size();
++    }
++
++    /** Number of IPs awaiting a reconnect (seen once, not yet verified). */
++    public static int pendingCount()
++    {
++        return pending.size();
++    }
++
++    /** Number of IPs with at least one tracked online connection. */
++    public static int trackedIpCount()
++    {
++        return connectionCounts.size();
++    }
++
+     /**
+      * Whether a handshake using the given virtual host should be refused. Only
+      * blocks raw-IP connections, and only while under attack.
+diff --git a/proxy/src/main/java/net/regksem/xwaterfall/command/CommandXWaterfall.java b/proxy/src/main/java/net/regksem/xwaterfall/command/CommandXWaterfall.java
+index e451dcbb..0b93cdc7 100644
+--- a/proxy/src/main/java/net/regksem/xwaterfall/command/CommandXWaterfall.java
++++ b/proxy/src/main/java/net/regksem/xwaterfall/command/CommandXWaterfall.java
+@@ -6,10 +6,15 @@ import net.md_5.bungee.api.CommandSender;
+ import net.md_5.bungee.api.plugin.Command;
+ import net.md_5.bungee.conf.Configuration;
+ import io.github.waterfallmc.waterfall.conf.WaterfallConfiguration;
++import net.regksem.xwaterfall.antibot.AntiBot;
++import net.regksem.xwaterfall.motd.AttackTracker;
++import net.regksem.xwaterfall.motd.MotdManager;
+ 
+ /**
+- * XWaterfall administration command. {@code /xwaterfall reload} re-reads every
+- * runtime-reloadable section of {@code xwaterfall.yml}; the per-section forms
++ * XWaterfall administration command. {@code /xwaterfall status} prints live
++ * diagnostics (ping/login rates, attack state, greylist sizes, cache hit-rate).
++ * {@code /xwaterfall reload} re-reads every runtime-reloadable section of
++ * {@code xwaterfall.yml}; the per-section forms
+  * ({@code forwarding|motd|antiexploit|antibot|messages reload}) reload just one.
+  * Network compression and event-loop thread counts are not reloadable (they bind
+  * to structures built once at boot) and require a full restart.
+@@ -33,6 +38,13 @@ public class CommandXWaterfall extends Command
+         }
+         WaterfallConfiguration xConfig = (WaterfallConfiguration) config;
+ 
++        // /xwaterfall status - runtime diagnostics
++        if ( args.length == 1 && args[0].equalsIgnoreCase( "status" ) )
++        {
++            printStatus( sender );
++            return;
++        }
++
+         // /xwaterfall reload - reload everything runtime-reloadable
+         if ( args.length == 1 && args[0].equalsIgnoreCase( "reload" ) )
+         {
+@@ -81,6 +93,54 @@ public class CommandXWaterfall extends Command
+             }
+         }
+ 
+-        sender.sendMessage( ChatColor.RED + "Usage: /xwaterfall [<forwarding|motd|antiexploit|antibot|messages>] reload" );
++        sender.sendMessage( ChatColor.RED + "Usage: /xwaterfall status | [<forwarding|motd|antiexploit|antibot|messages>] reload" );
++    }
++
++    private static void printStatus(CommandSender sender)
++    {
++        int online = BungeeCord.getInstance().getOnlineCount();
++
++        boolean pingAttack = AttackTracker.isUnderAttack();
++        int pingRate = AttackTracker.recentPerSecond();
++        int pingThreshold = AttackTracker.threshold();
++
++        long hits = MotdManager.cacheHits();
++        long misses = MotdManager.cacheMisses();
++        long total = hits + misses;
++        String hitRate = ( total == 0 ) ? "n/a" : String.format( "%.1f%%", 100.0D * hits / total );
++
++        sender.sendMessage( ChatColor.GOLD + "===== XWaterfall status =====" );
++        sender.sendMessage( ChatColor.YELLOW + "Players online: " + ChatColor.WHITE + online );
++
++        sender.sendMessage( ChatColor.YELLOW + "Server-list pings: " + ChatColor.WHITE + pingRate + "/s"
++                + ChatColor.GRAY + " (threshold " + ( pingThreshold < 0 ? "off" : pingThreshold + "/s" ) + ", "
++                + ( pingAttack ? ChatColor.RED + "UNDER ATTACK" : ChatColor.GREEN + "normal" ) + ChatColor.GRAY + ")" );
++        sender.sendMessage( ChatColor.YELLOW + "MOTD cache: " + ChatColor.WHITE + "hit-rate " + hitRate
++                + ChatColor.GRAY + " (" + hits + " hits / " + misses + " misses)" );
++
++        if ( !AntiBot.isEnabled() )
++        {
++            sender.sendMessage( ChatColor.YELLOW + "Anti-bot: " + ChatColor.GRAY + "disabled" );
++            return;
++        }
++        boolean botAttack = AntiBot.isUnderAttack();
++        int joins = AntiBot.recentJoinsPerSecond();
++        int joinThreshold = AntiBot.attackJoinsPerSecond();
++        sender.sendMessage( ChatColor.YELLOW + "Anti-bot: " + ChatColor.GREEN + "enabled"
++                + ChatColor.GRAY + " (" + ( botAttack ? ChatColor.RED + "UNDER ATTACK" : ChatColor.GREEN + "normal" ) + ChatColor.GRAY + ")" );
++        sender.sendMessage( ChatColor.YELLOW + "  Logins: " + ChatColor.WHITE + joins + "/s"
++                + ChatColor.GRAY + " (attack threshold " + ( joinThreshold < 0 ? "off" : joinThreshold + "/s" ) + ")" );
++        sender.sendMessage( ChatColor.YELLOW + "  Greylist: " + ChatColor.WHITE + AntiBot.verifiedCount() + ChatColor.GRAY + " verified, "
++                + ChatColor.WHITE + AntiBot.pendingCount() + ChatColor.GRAY + " awaiting reconnect" );
++        sender.sendMessage( ChatColor.YELLOW + "  Tracked IPs: " + ChatColor.WHITE + AntiBot.trackedIpCount()
++                + ChatColor.GRAY + " (max/IP " + ( AntiBot.maxConnectionsPerIp() <= 0 ? "off" : String.valueOf( AntiBot.maxConnectionsPerIp() ) ) + ")" );
++        sender.sendMessage( ChatColor.YELLOW + "  Checks: " + ChatColor.GRAY
++                + "direct-IP " + onOff( AntiBot.blockDirectIp() ) + ", liveness " + onOff( AntiBot.livenessEnabled() )
++                + ", name-filter " + onOff( AntiBot.hasNamePattern() ) );
++    }
++
++    private static String onOff(boolean value)
++    {
++        return value ? ( ChatColor.GREEN + "on" + ChatColor.GRAY ) : ( ChatColor.RED + "off" + ChatColor.GRAY );
+     }
+ }
+diff --git a/proxy/src/main/java/net/regksem/xwaterfall/motd/AttackTracker.java b/proxy/src/main/java/net/regksem/xwaterfall/motd/AttackTracker.java
+index c83e2c6f..336eea4d 100644
+--- a/proxy/src/main/java/net/regksem/xwaterfall/motd/AttackTracker.java
++++ b/proxy/src/main/java/net/regksem/xwaterfall/motd/AttackTracker.java
+@@ -40,6 +40,20 @@ public final class AttackTracker
+         currentCount.incrementAndGet();
+     }
+ 
++    /** @return the ping rate observed in the current or previous second. */
++    public static int recentPerSecond()
++    {
++        long second = System.currentTimeMillis() / 1000L;
++        int previous = ( second - currentSecond <= 1 ) ? lastSecondCount : 0;
++        return Math.max( currentCount.get(), previous );
++    }
++
++    /** @return the configured attack threshold (pings/sec), or -1 if disabled. */
++    public static int threshold()
++    {
++        return threshold;
++    }
++
+     /**
+      * @return true if the ping rate in the current or the previous second has
+      * reached the configured threshold.
+diff --git a/proxy/src/main/java/net/regksem/xwaterfall/motd/MotdManager.java b/proxy/src/main/java/net/regksem/xwaterfall/motd/MotdManager.java
+index 1959d861..b96649cc 100644
+--- a/proxy/src/main/java/net/regksem/xwaterfall/motd/MotdManager.java
++++ b/proxy/src/main/java/net/regksem/xwaterfall/motd/MotdManager.java
+@@ -50,6 +50,20 @@ public final class MotdManager
+     private static volatile String cachedTemplate;
+     private static volatile long cacheExpiryNanos;
+ 
++    // Hit/miss counters for the ping MOTD cache, surfaced by /xwaterfall status.
++    private static final java.util.concurrent.atomic.AtomicLong cacheHits = new java.util.concurrent.atomic.AtomicLong();
++    private static final java.util.concurrent.atomic.AtomicLong cacheMisses = new java.util.concurrent.atomic.AtomicLong();
++
++    public static long cacheHits()
++    {
++        return cacheHits.get();
++    }
++
++    public static long cacheMisses()
++    {
++        return cacheMisses.get();
++    }
++
+     /**
+      * Like {@link #render(String, int, int)} but reuses the previously rendered
+      * component while it is still within the cache window and the template is
+@@ -70,8 +84,10 @@ public final class MotdManager
+         // now - cacheExpiryNanos < 0 is the overflow-safe "not yet expired" test.
+         if ( cached != null && now - cacheExpiryNanos < 0L && template.equals( cachedTemplate ) )
+         {
++            cacheHits.incrementAndGet();
+             return cached;
+         }
++        cacheMisses.incrementAndGet();
+         BaseComponent rendered = render( template, online, max );
+         cachedDescription = rendered;
+         cachedTemplate = template;
+-- 
+2.50.1 (Apple Git-155)
+

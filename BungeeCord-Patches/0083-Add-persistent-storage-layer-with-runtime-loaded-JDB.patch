@@ -1,0 +1,822 @@
+From 106bda1efbd0c8af10ec506dfefd0f0abab8dab9 Mon Sep 17 00:00:00 2001
+From: regksem <regksem@tuta.io>
+Date: Sat, 20 Jun 2026 00:36:37 +0300
+Subject: [PATCH] Add persistent storage layer with runtime-loaded JDBC
+ backends (patch 0083)
+
+
+diff --git a/proxy/pom.xml b/proxy/pom.xml
+index 10215902..21ee1131 100644
+--- a/proxy/pom.xml
++++ b/proxy/pom.xml
+@@ -185,7 +185,8 @@
+             <groupId>io.github.waterfallmc</groupId>
+             <artifactId>waterfall-maven-resolver</artifactId>
+             <version>${project.version}</version>
+-            <scope>runtime</scope>
++            <!-- compile so XWaterfall's storage LibraryResolver can use Aether -->
++            <scope>compile</scope>
+         </dependency>
+         <!-- Waterfall start - Console improvements - bring back slf4j-->
+         <dependency>
+diff --git a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
+index a8d270e6..2a5dc991 100644
+--- a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
++++ b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
+@@ -110,6 +110,19 @@ public class WaterfallConfiguration extends Configuration {
+         // Anti-bot
+         applyAntiBot(xConfig);
+ 
++        // Persistent storage. Initialised once (the backend is not
++        // runtime-reloadable); seeds the anti-bot greylist on startup.
++        net.regksem.xwaterfall.storage.StorageManager.init(
++                xConfig.getString("storage.type", "memory"),
++                xConfig.getString("storage.file", "xwaterfall-data"),
++                xConfig.getString("storage.host", "127.0.0.1"),
++                xConfig.getInt("storage.port", 3306),
++                xConfig.getString("storage.database", "xwaterfall"),
++                xConfig.getString("storage.username", "root"),
++                xConfig.getString("storage.password", ""),
++                xConfig.getInt("storage.pool-size", 6),
++                xConfig.getString("storage.library-repository", "https://repo1.maven.org/maven2"));
++
+         // Message overrides for built-in translations
+         applyMessageOverrides(xConfig);
+     }
+diff --git a/proxy/src/main/java/net/regksem/xwaterfall/antibot/AntiBot.java b/proxy/src/main/java/net/regksem/xwaterfall/antibot/AntiBot.java
+index d8eda792..bdadfea0 100644
+--- a/proxy/src/main/java/net/regksem/xwaterfall/antibot/AntiBot.java
++++ b/proxy/src/main/java/net/regksem/xwaterfall/antibot/AntiBot.java
+@@ -149,6 +149,23 @@ public final class AntiBot
+         return verified.size();
+     }
+ 
++    /**
++     * Seeds the verified set from persistent storage at startup. Expired entries
++     * are ignored. Called by the storage subsystem before any logins arrive.
++     */
++    public static void primeVerified(Map<String, Long> entries)
++    {
++        long now = System.currentTimeMillis();
++        for ( Map.Entry<String, Long> entry : entries.entrySet() )
++        {
++            Long expiry = entry.getValue();
++            if ( entry.getKey() != null && expiry != null && expiry > now )
++            {
++                verified.put( entry.getKey(), expiry );
++            }
++        }
++    }
++
+     /** Number of IPs awaiting a reconnect (seen once, not yet verified). */
+     public static int pendingCount()
+     {
+@@ -223,8 +240,11 @@ public final class AntiBot
+                 if ( age >= reconnectMinDelayMs && age <= reconnectWindowMs )
+                 {
+                     // A genuine reconnect inside the window: promote to verified.
+-                    verified.put( ip, now + verifiedDurationMs );
++                    long verifiedExpiry = now + verifiedDurationMs;
++                    verified.put( ip, verifiedExpiry );
+                     pending.remove( ip );
++                    // Persist the trust so it survives a restart (no-op when storage is off).
++                    net.regksem.xwaterfall.storage.StorageManager.greylistPut( ip, verifiedExpiry );
+                     sweepIfNeeded( now );
+                     return Result.ALLOW;
+                 }
+diff --git a/proxy/src/main/java/net/regksem/xwaterfall/command/CommandXWaterfall.java b/proxy/src/main/java/net/regksem/xwaterfall/command/CommandXWaterfall.java
+index 0b93cdc7..ad0ab32a 100644
+--- a/proxy/src/main/java/net/regksem/xwaterfall/command/CommandXWaterfall.java
++++ b/proxy/src/main/java/net/regksem/xwaterfall/command/CommandXWaterfall.java
+@@ -117,6 +117,8 @@ public class CommandXWaterfall extends Command
+                 + ( pingAttack ? ChatColor.RED + "UNDER ATTACK" : ChatColor.GREEN + "normal" ) + ChatColor.GRAY + ")" );
+         sender.sendMessage( ChatColor.YELLOW + "MOTD cache: " + ChatColor.WHITE + "hit-rate " + hitRate
+                 + ChatColor.GRAY + " (" + hits + " hits / " + misses + " misses)" );
++        sender.sendMessage( ChatColor.YELLOW + "Storage: " + ChatColor.WHITE
++                + net.regksem.xwaterfall.storage.StorageManager.description() );
+ 
+         if ( !AntiBot.isEnabled() )
+         {
+diff --git a/proxy/src/main/java/net/regksem/xwaterfall/storage/DriverShim.java b/proxy/src/main/java/net/regksem/xwaterfall/storage/DriverShim.java
+new file mode 100644
+index 00000000..72ed037f
+--- /dev/null
++++ b/proxy/src/main/java/net/regksem/xwaterfall/storage/DriverShim.java
+@@ -0,0 +1,72 @@
++package net.regksem.xwaterfall.storage;
++
++import java.sql.Connection;
++import java.sql.Driver;
++import java.sql.DriverPropertyInfo;
++import java.sql.SQLException;
++import java.sql.SQLFeatureNotSupportedException;
++import java.util.Properties;
++import java.util.logging.Logger;
++
++/**
++ * Delegating wrapper around a JDBC {@link Driver} that was loaded from a child
++ * class loader (the {@link LibraryResolver} download).
++ *
++ * <p>{@link java.sql.DriverManager} refuses to use a driver whose class is not
++ * visible to the caller's class loader. Registering this shim &mdash; which is
++ * loaded by the proxy class loader, the parent of the library loader &mdash;
++ * makes the downloaded driver usable from anywhere, including HikariCP. This is
++ * the standard pattern for loading JDBC drivers from an isolated class loader.
++ */
++final class DriverShim implements Driver
++{
++
++    private final Driver delegate;
++
++    DriverShim(Driver delegate)
++    {
++        this.delegate = delegate;
++    }
++
++    @Override
++    public Connection connect(String url, Properties info) throws SQLException
++    {
++        return delegate.connect( url, info );
++    }
++
++    @Override
++    public boolean acceptsURL(String url) throws SQLException
++    {
++        return delegate.acceptsURL( url );
++    }
++
++    @Override
++    public DriverPropertyInfo[] getPropertyInfo(String url, Properties info) throws SQLException
++    {
++        return delegate.getPropertyInfo( url, info );
++    }
++
++    @Override
++    public int getMajorVersion()
++    {
++        return delegate.getMajorVersion();
++    }
++
++    @Override
++    public int getMinorVersion()
++    {
++        return delegate.getMinorVersion();
++    }
++
++    @Override
++    public boolean jdbcCompliant()
++    {
++        return delegate.jdbcCompliant();
++    }
++
++    @Override
++    public Logger getParentLogger() throws SQLFeatureNotSupportedException
++    {
++        return delegate.getParentLogger();
++    }
++}
+diff --git a/proxy/src/main/java/net/regksem/xwaterfall/storage/LibraryResolver.java b/proxy/src/main/java/net/regksem/xwaterfall/storage/LibraryResolver.java
+new file mode 100644
+index 00000000..5333b48b
+--- /dev/null
++++ b/proxy/src/main/java/net/regksem/xwaterfall/storage/LibraryResolver.java
+@@ -0,0 +1,114 @@
++package net.regksem.xwaterfall.storage;
++
++import java.io.File;
++import java.net.MalformedURLException;
++import java.net.URL;
++import java.net.URLClassLoader;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++import java.util.logging.Level;
++import java.util.logging.Logger;
++import org.apache.maven.repository.internal.MavenRepositorySystemUtils;
++import org.eclipse.aether.DefaultRepositorySystemSession;
++import org.eclipse.aether.RepositorySystem;
++import org.eclipse.aether.artifact.Artifact;
++import org.eclipse.aether.artifact.DefaultArtifact;
++import org.eclipse.aether.collection.CollectRequest;
++import org.eclipse.aether.connector.basic.BasicRepositoryConnectorFactory;
++import org.eclipse.aether.graph.Dependency;
++import org.eclipse.aether.impl.DefaultServiceLocator;
++import org.eclipse.aether.repository.LocalRepository;
++import org.eclipse.aether.repository.RemoteRepository;
++import org.eclipse.aether.resolution.ArtifactResult;
++import org.eclipse.aether.resolution.DependencyRequest;
++import org.eclipse.aether.resolution.DependencyResult;
++import org.eclipse.aether.spi.connector.RepositoryConnectorFactory;
++import org.eclipse.aether.spi.connector.transport.TransporterFactory;
++import org.eclipse.aether.transfer.AbstractTransferListener;
++import org.eclipse.aether.transfer.TransferEvent;
++import org.eclipse.aether.transport.http.HttpTransporterFactory;
++
++/**
++ * Resolves Maven artifacts (with full transitive dependencies) at runtime and
++ * exposes them through an isolated {@link URLClassLoader}, so heavy optional
++ * libraries &mdash; the JDBC drivers and the connection pool used by
++ * {@link SqlStorage} &mdash; are downloaded on demand into {@code libraries/}
++ * instead of being shipped inside the proxy jar.
++ *
++ * <p>This mirrors the mechanism BungeeCord already uses for plugin
++ * {@code libraries:}, reusing the bundled Aether resolver, so checksum
++ * verification and transitive resolution (e.g. the driver's own dependencies)
++ * are handled for us.
++ */
++final class LibraryResolver
++{
++
++    private final Logger logger;
++    private final RepositorySystem repository;
++    private final DefaultRepositorySystemSession session;
++    private final List<RemoteRepository> repositories;
++
++    LibraryResolver(Logger logger, String repositoryUrl)
++    {
++        this.logger = logger;
++
++        DefaultServiceLocator locator = MavenRepositorySystemUtils.newServiceLocator();
++        locator.addService( RepositoryConnectorFactory.class, BasicRepositoryConnectorFactory.class );
++        locator.addService( TransporterFactory.class, HttpTransporterFactory.class );
++
++        this.repository = locator.getService( RepositorySystem.class );
++        this.session = MavenRepositorySystemUtils.newSession();
++        session.setLocalRepositoryManager( repository.newLocalRepositoryManager( session, new LocalRepository( "libraries" ) ) );
++        session.setTransferListener( new AbstractTransferListener()
++        {
++            @Override
++            public void transferStarted(TransferEvent event)
++            {
++                logger.log( Level.INFO, "[XWaterfall] Downloading {0}", event.getResource().getRepositoryUrl() + event.getResource().getResourceName() );
++            }
++        } );
++        session.setSystemProperties( System.getProperties() );
++        session.setReadOnly();
++
++        this.repositories = repository.newResolutionRepositories( session, Arrays.asList(
++                new RemoteRepository.Builder( "central", "default", repositoryUrl ).build() ) );
++    }
++
++    /**
++     * Resolves the given {@code group:artifact:version} coordinates and returns a
++     * class loader that exposes them and their transitive dependencies.
++     *
++     * @throws Exception if any artifact cannot be resolved
++     */
++    ClassLoader resolve(List<String> coordinates) throws Exception
++    {
++        List<Dependency> dependencies = new ArrayList<>();
++        for ( String coordinate : coordinates )
++        {
++            Artifact artifact = new DefaultArtifact( coordinate );
++            dependencies.add( new Dependency( artifact, null ) );
++        }
++
++        DependencyResult result = repository.resolveDependencies( session,
++                new DependencyRequest( new CollectRequest( (Dependency) null, dependencies, repositories ), null ) );
++
++        List<URL> jarFiles = new ArrayList<>();
++        for ( ArtifactResult artifact : result.getArtifactResults() )
++        {
++            File file = artifact.getArtifact().getFile();
++            try
++            {
++                jarFiles.add( file.toURI().toURL() );
++            } catch ( MalformedURLException ex )
++            {
++                throw new AssertionError( ex );
++            }
++            logger.log( Level.INFO, "[XWaterfall] Loaded library {0}", file );
++        }
++
++        // Parent is this class's loader, so the libraries can see slf4j and the
++        // java.sql.* API already on the proxy classpath.
++        return new URLClassLoader( jarFiles.toArray( new URL[ 0 ] ), LibraryResolver.class.getClassLoader() );
++    }
++}
+diff --git a/proxy/src/main/java/net/regksem/xwaterfall/storage/SqlStorage.java b/proxy/src/main/java/net/regksem/xwaterfall/storage/SqlStorage.java
+new file mode 100644
+index 00000000..3a97ba72
+--- /dev/null
++++ b/proxy/src/main/java/net/regksem/xwaterfall/storage/SqlStorage.java
+@@ -0,0 +1,194 @@
++package net.regksem.xwaterfall.storage;
++
++import java.lang.reflect.Method;
++import java.sql.Connection;
++import java.sql.Driver;
++import java.sql.DriverManager;
++import java.sql.PreparedStatement;
++import java.sql.ResultSet;
++import java.sql.Statement;
++import java.util.HashMap;
++import java.util.Map;
++
++/**
++ * {@link Storage} backed by any JDBC database, pooled with HikariCP.
++ *
++ * <p>The driver and HikariCP are loaded from a {@link LibraryResolver} class
++ * loader, so this class must not reference them at compile time: HikariCP is
++ * driven through a tiny reflective surface (config setters + {@code
++ * getConnection}), and once a {@link Connection} is obtained everything else is
++ * plain {@link java.sql} (which lives in the JDK and is visible everywhere). The
++ * schema and queries use only portable SQL so the same code serves H2, SQLite,
++ * MySQL/MariaDB and PostgreSQL.
++ */
++final class SqlStorage implements Storage
++{
++
++    private static final String TABLE = "xwaterfall_store";
++
++    private final ClassLoader libraryLoader;
++    private final String driverClass;
++    private final String jdbcUrl;
++    private final String username;
++    private final String password;
++    private final int poolSize;
++
++    private Object dataSource;       // com.zaxxer.hikari.HikariDataSource
++    private Method getConnection;    // HikariDataSource#getConnection
++    private Method closeDataSource;  // HikariDataSource#close
++
++    SqlStorage(ClassLoader libraryLoader, String driverClass, String jdbcUrl, String username, String password, int poolSize)
++    {
++        this.libraryLoader = libraryLoader;
++        this.driverClass = driverClass;
++        this.jdbcUrl = jdbcUrl;
++        this.username = username;
++        this.password = password;
++        this.poolSize = Math.max( 1, poolSize );
++    }
++
++    @Override
++    public void init() throws Exception
++    {
++        // Register the driver via a shim so DriverManager (and thus HikariCP) can
++        // use it even though it lives in a child class loader.
++        Driver real = (Driver) Class.forName( driverClass, true, libraryLoader ).getDeclaredConstructor().newInstance();
++        DriverManager.registerDriver( new DriverShim( real ) );
++
++        Class<?> configClass = Class.forName( "com.zaxxer.hikari.HikariConfig", true, libraryLoader );
++        Object config = configClass.getDeclaredConstructor().newInstance();
++        configClass.getMethod( "setJdbcUrl", String.class ).invoke( config, jdbcUrl );
++        if ( username != null )
++        {
++            configClass.getMethod( "setUsername", String.class ).invoke( config, username );
++        }
++        if ( password != null )
++        {
++            configClass.getMethod( "setPassword", String.class ).invoke( config, password );
++        }
++        configClass.getMethod( "setMaximumPoolSize", int.class ).invoke( config, poolSize );
++        configClass.getMethod( "setPoolName", String.class ).invoke( config, "XWaterfall-Storage" );
++
++        Class<?> dataSourceClass = Class.forName( "com.zaxxer.hikari.HikariDataSource", true, libraryLoader );
++        // HikariCP starts its pool here and may load classes via the context loader.
++        ClassLoader previous = Thread.currentThread().getContextClassLoader();
++        try
++        {
++            Thread.currentThread().setContextClassLoader( libraryLoader );
++            this.dataSource = dataSourceClass.getConstructor( configClass ).newInstance( config );
++        } finally
++        {
++            Thread.currentThread().setContextClassLoader( previous );
++        }
++        this.getConnection = dataSourceClass.getMethod( "getConnection" );
++        this.closeDataSource = dataSourceClass.getMethod( "close" );
++
++        createSchema();
++    }
++
++    private Connection connection() throws Exception
++    {
++        return (Connection) getConnection.invoke( dataSource );
++    }
++
++    private void createSchema() throws Exception
++    {
++        String ddl = "CREATE TABLE IF NOT EXISTS " + TABLE + " ("
++                + "namespace VARCHAR(64) NOT NULL, "
++                + "k VARCHAR(255) NOT NULL, "
++                + "expiry BIGINT NOT NULL, "
++                + "PRIMARY KEY (namespace, k))";
++        try ( Connection conn = connection(); Statement st = conn.createStatement() )
++        {
++            st.executeUpdate( ddl );
++        }
++    }
++
++    @Override
++    public Map<String, Long> loadAll(String namespace) throws Exception
++    {
++        Map<String, Long> result = new HashMap<>();
++        long now = System.currentTimeMillis();
++        try ( Connection conn = connection();
++              PreparedStatement ps = conn.prepareStatement( "SELECT k, expiry FROM " + TABLE + " WHERE namespace = ? AND (expiry = 0 OR expiry > ?)" ) )
++        {
++            ps.setString( 1, namespace );
++            ps.setLong( 2, now );
++            try ( ResultSet rs = ps.executeQuery() )
++            {
++                while ( rs.next() )
++                {
++                    result.put( rs.getString( 1 ), rs.getLong( 2 ) );
++                }
++            }
++        }
++        return result;
++    }
++
++    @Override
++    public void put(String namespace, String key, long expiry) throws Exception
++    {
++        // Portable upsert: try UPDATE, fall back to INSERT. Good enough for the
++        // low write rate of these stores and avoids dialect-specific syntax.
++        try ( Connection conn = connection() )
++        {
++            try ( PreparedStatement update = conn.prepareStatement( "UPDATE " + TABLE + " SET expiry = ? WHERE namespace = ? AND k = ?" ) )
++            {
++                update.setLong( 1, expiry );
++                update.setString( 2, namespace );
++                update.setString( 3, key );
++                if ( update.executeUpdate() > 0 )
++                {
++                    return;
++                }
++            }
++            try ( PreparedStatement insert = conn.prepareStatement( "INSERT INTO " + TABLE + " (namespace, k, expiry) VALUES (?, ?, ?)" ) )
++            {
++                insert.setString( 1, namespace );
++                insert.setString( 2, key );
++                insert.setLong( 3, expiry );
++                insert.executeUpdate();
++            }
++        }
++    }
++
++    @Override
++    public void remove(String namespace, String key) throws Exception
++    {
++        try ( Connection conn = connection();
++              PreparedStatement ps = conn.prepareStatement( "DELETE FROM " + TABLE + " WHERE namespace = ? AND k = ?" ) )
++        {
++            ps.setString( 1, namespace );
++            ps.setString( 2, key );
++            ps.executeUpdate();
++        }
++    }
++
++    @Override
++    public void purgeExpired(String namespace, long now) throws Exception
++    {
++        try ( Connection conn = connection();
++              PreparedStatement ps = conn.prepareStatement( "DELETE FROM " + TABLE + " WHERE namespace = ? AND expiry <> 0 AND expiry <= ?" ) )
++        {
++            ps.setString( 1, namespace );
++            ps.setLong( 2, now );
++            ps.executeUpdate();
++        }
++    }
++
++    @Override
++    public void close()
++    {
++        if ( dataSource != null && closeDataSource != null )
++        {
++            try
++            {
++                closeDataSource.invoke( dataSource );
++            } catch ( ReflectiveOperationException ignored )
++            {
++                // shutting down anyway
++            }
++            dataSource = null;
++        }
++    }
++}
+diff --git a/proxy/src/main/java/net/regksem/xwaterfall/storage/Storage.java b/proxy/src/main/java/net/regksem/xwaterfall/storage/Storage.java
+new file mode 100644
+index 00000000..e537ae24
+--- /dev/null
++++ b/proxy/src/main/java/net/regksem/xwaterfall/storage/Storage.java
+@@ -0,0 +1,34 @@
++package net.regksem.xwaterfall.storage;
++
++import java.util.Map;
++
++/**
++ * A small namespaced, expiring key-value store backing XWaterfall's persistent
++ * features. The first consumer is the anti-bot verified-IP greylist; the same
++ * abstraction is meant to be reused later (e.g. limbo-verification results or
++ * bans) by picking a different {@code namespace}.
++ *
++ * <p>Entries carry an expiry as an epoch-millis timestamp; {@code 0} means "no
++ * expiry". Implementations must treat expired entries as absent.
++ */
++public interface Storage
++{
++
++    /** Opens the backend (connection pool, schema creation). */
++    void init() throws Exception;
++
++    /** Releases all resources. Safe to call more than once. */
++    void close();
++
++    /** @return every non-expired {@code key -> expiry} pair in the namespace. */
++    Map<String, Long> loadAll(String namespace) throws Exception;
++
++    /** Inserts or updates an entry. */
++    void put(String namespace, String key, long expiry) throws Exception;
++
++    /** Removes an entry if present. */
++    void remove(String namespace, String key) throws Exception;
++
++    /** Deletes every entry in the namespace whose expiry is in the past. */
++    void purgeExpired(String namespace, long now) throws Exception;
++}
+diff --git a/proxy/src/main/java/net/regksem/xwaterfall/storage/StorageManager.java b/proxy/src/main/java/net/regksem/xwaterfall/storage/StorageManager.java
+new file mode 100644
+index 00000000..6bb9520d
+--- /dev/null
++++ b/proxy/src/main/java/net/regksem/xwaterfall/storage/StorageManager.java
+@@ -0,0 +1,228 @@
++package net.regksem.xwaterfall.storage;
++
++import java.util.Arrays;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.ThreadFactory;
++import java.util.concurrent.TimeUnit;
++import java.util.logging.Level;
++import net.md_5.bungee.api.ProxyServer;
++import net.regksem.xwaterfall.antibot.AntiBot;
++
++/**
++ * Owns the optional persistent {@link Storage} backend and wires it to the
++ * features that use it. Static and initialised once at startup (changing the
++ * backend requires a restart), mirroring the other XWaterfall subsystems.
++ *
++ * <p>The current consumer is the anti-bot verified-IP greylist: on startup the
++ * stored entries are loaded into {@link AntiBot}, and each newly verified IP is
++ * written back asynchronously so trust survives restarts.
++ */
++public final class StorageManager
++{
++
++    private StorageManager()
++    {
++    }
++
++    /** Greylist namespace: verified (trusted) client IPs. */
++    private static final String NS_VERIFIED = "verified_ip";
++
++    private static final String HIKARI = "com.zaxxer:HikariCP:4.0.3";
++
++    private static volatile boolean initialized = false;
++    private static volatile Storage storage; // null = disabled (in-memory only)
++    private static volatile String description = "disabled (in-memory only)";
++    private static ExecutorService writer;
++
++    public enum Type
++    {
++        MEMORY, H2, SQLITE, MYSQL, MARIADB, POSTGRESQL;
++
++        static Type fromString(String value)
++        {
++            if ( value != null )
++            {
++                for ( Type type : values() )
++                {
++                    if ( type.name().equalsIgnoreCase( value.trim() ) )
++                    {
++                        return type;
++                    }
++                }
++            }
++            return MEMORY;
++        }
++    }
++
++    /**
++     * Initialises the backend once. Subsequent calls are ignored (the backend is
++     * not runtime-reloadable). On any failure it logs and falls back to the
++     * in-memory behaviour so the proxy still starts.
++     */
++    public static synchronized void init(String typeName, String file, String host, int port,
++            String database, String username, String password, int poolSize, String repositoryUrl)
++    {
++        if ( initialized )
++        {
++            return;
++        }
++        initialized = true;
++
++        Type type = Type.fromString( typeName );
++        if ( type == Type.MEMORY )
++        {
++            return; // nothing persistent; AntiBot keeps its in-memory maps only
++        }
++
++        try
++        {
++            List<String> coordinates;
++            String driver;
++            String url;
++            String user = username;
++            String pass = password;
++            int pool = Math.max( 1, poolSize );
++
++            switch ( type )
++            {
++                case H2:
++                    coordinates = Arrays.asList( HIKARI, "com.h2database:h2:2.2.224" );
++                    driver = "org.h2.Driver";
++                    url = "jdbc:h2:file:./" + file + ";AUTO_SERVER=TRUE";
++                    user = "sa";
++                    pass = "";
++                    break;
++                case SQLITE:
++                    coordinates = Arrays.asList( HIKARI, "org.xerial:sqlite-jdbc:3.45.3.0" );
++                    driver = "org.sqlite.JDBC";
++                    url = "jdbc:sqlite:" + file + ".db";
++                    user = null;
++                    pass = null;
++                    pool = 1; // SQLite is single-writer
++                    break;
++                case MYSQL:
++                    coordinates = Arrays.asList( HIKARI, "com.mysql:mysql-connector-j:8.4.0" );
++                    driver = "com.mysql.cj.jdbc.Driver";
++                    url = "jdbc:mysql://" + host + ":" + port + "/" + database;
++                    break;
++                case MARIADB:
++                    coordinates = Arrays.asList( HIKARI, "org.mariadb.jdbc:mariadb-java-client:3.4.0" );
++                    driver = "org.mariadb.jdbc.Driver";
++                    url = "jdbc:mariadb://" + host + ":" + port + "/" + database;
++                    break;
++                case POSTGRESQL:
++                    coordinates = Arrays.asList( HIKARI, "org.postgresql:postgresql:42.7.3" );
++                    driver = "org.postgresql.Driver";
++                    url = "jdbc:postgresql://" + host + ":" + port + "/" + database;
++                    break;
++                default:
++                    return;
++            }
++
++            ProxyServer.getInstance().getLogger().log( Level.INFO, "[XWaterfall] Initialising {0} storage; downloading libraries if needed...", type );
++            ClassLoader libraryLoader = new LibraryResolver( ProxyServer.getInstance().getLogger(), repositoryUrl ).resolve( coordinates );
++            SqlStorage sql = new SqlStorage( libraryLoader, driver, url, user, pass, pool );
++            sql.init();
++            storage = sql;
++            description = type.name().toLowerCase( Locale.ROOT ) + " (connected)";
++
++            writer = Executors.newSingleThreadExecutor( daemonFactory() );
++            Runtime.getRuntime().addShutdownHook( new Thread( StorageManager::shutdown, "XWaterfall-Storage-Shutdown" ) );
++
++            primeGreylist();
++            ProxyServer.getInstance().getLogger().log( Level.INFO, "[XWaterfall] Storage backend ready: {0}", description );
++        } catch ( Exception ex )
++        {
++            storage = null;
++            description = "unavailable (falling back to in-memory)";
++            ProxyServer.getInstance().getLogger().log( Level.WARNING, "[XWaterfall] Could not initialise persistent storage; continuing in-memory", ex );
++        }
++    }
++
++    /** Loads persisted verified IPs into AntiBot and purges expired rows. */
++    private static void primeGreylist()
++    {
++        if ( storage == null )
++        {
++            return;
++        }
++        try
++        {
++            storage.purgeExpired( NS_VERIFIED, System.currentTimeMillis() );
++            Map<String, Long> entries = storage.loadAll( NS_VERIFIED );
++            AntiBot.primeVerified( entries );
++            ProxyServer.getInstance().getLogger().log( Level.INFO, "[XWaterfall] Loaded {0} verified IP(s) from storage", entries.size() );
++        } catch ( Exception ex )
++        {
++            ProxyServer.getInstance().getLogger().log( Level.WARNING, "[XWaterfall] Could not load verified IPs from storage", ex );
++        }
++    }
++
++    /** Persists a newly verified IP. No-op when storage is disabled. */
++    public static void greylistPut(String ip, long expiry)
++    {
++        final Storage current = storage;
++        final ExecutorService exec = writer;
++        if ( current == null || exec == null )
++        {
++            return;
++        }
++        exec.execute( () ->
++        {
++            try
++            {
++                current.put( NS_VERIFIED, ip, expiry );
++            } catch ( Exception ex )
++            {
++                ProxyServer.getInstance().getLogger().log( Level.FINE, "[XWaterfall] Failed to persist verified IP", ex );
++            }
++        } );
++    }
++
++    /** @return whether a persistent backend is active. */
++    public static boolean isPersistent()
++    {
++        return storage != null;
++    }
++
++    /** @return a short human-readable backend description for diagnostics. */
++    public static String description()
++    {
++        return description;
++    }
++
++    private static void shutdown()
++    {
++        ExecutorService exec = writer;
++        if ( exec != null )
++        {
++            exec.shutdown();
++            try
++            {
++                exec.awaitTermination( 5, TimeUnit.SECONDS );
++            } catch ( InterruptedException ignored )
++            {
++                Thread.currentThread().interrupt();
++            }
++        }
++        Storage current = storage;
++        if ( current != null )
++        {
++            current.close();
++        }
++    }
++
++    private static ThreadFactory daemonFactory()
++    {
++        return runnable ->
++        {
++            Thread thread = new Thread( runnable, "XWaterfall-Storage-Writer" );
++            thread.setDaemon( true );
++            return thread;
++        };
++    }
++}
+diff --git a/proxy/src/main/resources/xwaterfall.yml b/proxy/src/main/resources/xwaterfall.yml
+index c36a6fb3..d61644c5 100644
+--- a/proxy/src/main/resources/xwaterfall.yml
++++ b/proxy/src/main/resources/xwaterfall.yml
+@@ -321,3 +321,43 @@ messages:
+   kick_message: "&cYou have been kicked off the proxy."
+   reject_transfer: "&cYour transfer was rejected."
+   packet_limit_kick: "&cYou have sent too many packets"
++
++# ---------------------------------------------------------------------------
++#  Persistent storage
++# ---------------------------------------------------------------------------
++# Optional database used to persist data across restarts. The first consumer is
++# the anti-bot greylist: verified (trusted) IPs are remembered, so returning
++# players are not re-challenged after a proxy restart.
++#
++# The JDBC driver and the connection pool (HikariCP) are NOT bundled in the jar;
++# they are downloaded on first use into the "libraries" folder (the same way
++# plugin libraries are handled). An internet connection is therefore needed the
++# first time a database backend is enabled. The backend is chosen at startup and
++# is not affected by "/xwaterfall reload" - changing it requires a restart.
++storage:
++  # Backend type:
++  # - "memory":     no persistence; everything stays in RAM (default, no download)
++  # - "h2":         embedded file database (zero setup, good default for one proxy)
++  # - "sqlite":     embedded file database
++  # - "mysql":      external MySQL server
++  # - "mariadb":    external MariaDB server
++  # - "postgresql": external PostgreSQL server
++  type: memory
++
++  # Data file name for the embedded backends (h2 / sqlite). Created if missing.
++  file: "xwaterfall-data"
++
++  # Connection settings for the external backends (mysql / mariadb / postgresql).
++  host: "127.0.0.1"
++  port: 3306
++  database: "xwaterfall"
++  username: "root"
++  password: ""
++
++  # HikariCP connection pool size for external backends. Embedded backends use a
++  # single connection regardless.
++  pool-size: 6
++
++  # Maven repository the driver and HikariCP are downloaded from on first use.
++  # Point this at a mirror if you cannot reach Maven Central.
++  library-repository: "https://repo1.maven.org/maven2"
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,430 @@
+From 3b88be770678dc4fc9ce2a8fcb5a4965e0ea9003 Mon Sep 17 00:00:00 2001
+From: regksem <regksem@tuta.io>
+Date: Fri, 19 Jun 2026 23:45:20 +0300
+Subject: [PATCH] Auto-migrate xwaterfall.yml: append new keys to existing
+ files (patch 0080)
+
+
+diff --git a/proxy/src/main/java/net/regksem/xwaterfall/conf/ConfigMigrator.java b/proxy/src/main/java/net/regksem/xwaterfall/conf/ConfigMigrator.java
+new file mode 100644
+index 00000000..21e4c938
+--- /dev/null
++++ b/proxy/src/main/java/net/regksem/xwaterfall/conf/ConfigMigrator.java
+@@ -0,0 +1,380 @@
++package net.regksem.xwaterfall.conf;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.StandardCopyOption;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++import java.util.logging.Level;
++import java.util.logging.Logger;
++import org.yaml.snakeyaml.Yaml;
++import org.yaml.snakeyaml.error.YAMLException;
++
++/**
++ * Comment-preserving forward-migration for {@code xwaterfall.yml}.
++ *
++ * <p>When a new XWaterfall version introduces config keys, an existing on-disk
++ * file written by an older version is missing them and silently falls back to
++ * code defaults &mdash; so the new options are invisible to the admin. This
++ * migrator copies any missing key (together with the documentation comment block
++ * that sits directly above it in the bundled default) from the packaged resource
++ * into the user's file, <strong>in place</strong>, without touching or
++ * reordering anything that is already there.
++ *
++ * <p>It is deliberately append/insert-only and line-based: existing lines are
++ * never rewritten, so user edits and comments are preserved verbatim. Whole
++ * missing top-level sections are appended at the end of the file; a key missing
++ * from an <em>existing</em> section is inserted at the end of that section at the
++ * correct indentation (the lines are copied verbatim from the bundled resource,
++ * which uses the same indentation scheme).
++ *
++ * <p>Safety: the original file is backed up to {@code xwaterfall.yml.bak} before
++ * any write, the merged result is re-parsed with SnakeYAML and only written if
++ * it is still valid YAML, and any unexpected error aborts the migration leaving
++ * the original file untouched.
++ */
++final class ConfigMigrator
++{
++
++    private ConfigMigrator()
++    {
++    }
++
++    /**
++     * Top-level sections that must never be auto-completed. {@code messages:}
++     * documents "delete a line to fall back to the built-in default", so
++     * re-adding deleted keys would fight the user's intent.
++     */
++    private static final Set<String> EXCLUDED_ROOTS = new HashSet<>( Arrays.asList( "messages" ) );
++
++    /**
++     * Adds any keys present in the bundled default but missing from the on-disk
++     * file. No-op when nothing is missing or anything goes wrong.
++     *
++     * @return the number of keys (sections) inserted
++     */
++    static int migrate(Path file, String resourceName, Logger logger)
++    {
++        try
++        {
++            if ( !Files.exists( file ) )
++            {
++                return 0;
++            }
++            List<String> bundled = readResource( resourceName );
++            if ( bundled == null )
++            {
++                return 0;
++            }
++            List<String> userLines = new ArrayList<>( Files.readAllLines( file, StandardCharsets.UTF_8 ) );
++
++            List<Node> bundledNodes = parse( bundled );
++            List<Node> userNodes = parse( userLines );
++            Set<String> userPaths = new HashSet<>();
++            for ( Node n : userNodes )
++            {
++                userPaths.add( n.path );
++            }
++
++            // Collect the "missing roots": a node absent from the user file whose
++            // parent IS present (or that is itself top-level). Inserting a root
++            // brings its whole sub-tree along, so deeper missing nodes are skipped.
++            List<Insertion> insertions = new ArrayList<>();
++            for ( Node node : bundledNodes )
++            {
++                if ( EXCLUDED_ROOTS.contains( node.root() ) )
++                {
++                    continue;
++                }
++                if ( userPaths.contains( node.path ) )
++                {
++                    continue;
++                }
++                boolean topLevel = node.parent == null;
++                if ( !topLevel && !userPaths.contains( node.parent ) )
++                {
++                    continue; // ancestor is itself missing; it will carry this node
++                }
++
++                List<String> block = bundled.subList( node.leadStart, node.blockEnd );
++                if ( topLevel )
++                {
++                    insertions.add( new Insertion( userLines.size(), new ArrayList<>( block ), true ) );
++                } else
++                {
++                    Node parent = findUserParent( userNodes, node.parent );
++                    if ( parent == null )
++                    {
++                        continue; // should not happen (userPaths said it exists), be defensive
++                    }
++                    insertions.add( new Insertion( parent.blockEnd, new ArrayList<>( block ), false ) );
++                }
++            }
++
++            if ( insertions.isEmpty() )
++            {
++                return 0;
++            }
++
++            // Apply bottom-up so earlier indices stay valid as we splice.
++            insertions.sort( (a, b) -> Integer.compare( b.position, a.position ) );
++            for ( Insertion ins : insertions )
++            {
++                List<String> chunk = new ArrayList<>();
++                if ( ins.topLevel )
++                {
++                    // Separate appended sections from prior content with a blank line.
++                    if ( !userLines.isEmpty() && !userLines.get( userLines.size() - 1 ).trim().isEmpty() )
++                    {
++                        chunk.add( "" );
++                    }
++                }
++                chunk.addAll( ins.lines );
++                userLines.addAll( ins.position, chunk );
++            }
++
++            String merged = String.join( "\n", userLines ) + "\n";
++
++            // Validate the result before committing it.
++            try
++            {
++                new Yaml().load( merged );
++            } catch ( YAMLException ex )
++            {
++                logger.log( Level.WARNING, "Skipping " + file.getFileName() + " auto-migration: merged result would be invalid YAML", ex );
++                return 0;
++            }
++
++            // Back up, then write.
++            Path backup = file.resolveSibling( file.getFileName() + ".bak" );
++            Files.copy( file, backup, StandardCopyOption.REPLACE_EXISTING );
++            Files.write( file, merged.getBytes( StandardCharsets.UTF_8 ) );
++            logger.log( Level.INFO, "Updated {0} with {1} new option(s) from this version (backup: {2}).",
++                    new Object[]{ file.getFileName(), insertions.size(), backup.getFileName() } );
++            return insertions.size();
++        } catch ( IOException | RuntimeException ex )
++        {
++            logger.log( Level.WARNING, "Could not auto-migrate " + file.getFileName() + ", leaving it unchanged", ex );
++            return 0;
++        }
++    }
++
++    private static List<String> readResource(String name) throws IOException
++    {
++        try ( InputStream in = ConfigMigrator.class.getClassLoader().getResourceAsStream( name ) )
++        {
++            if ( in == null )
++            {
++                return null;
++            }
++            byte[] bytes = readAll( in );
++            return new ArrayList<>( Arrays.asList( new String( bytes, StandardCharsets.UTF_8 ).split( "\n", -1 ) ) );
++        }
++    }
++
++    private static byte[] readAll(InputStream in) throws IOException
++    {
++        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
++        byte[] buf = new byte[8192];
++        int read;
++        while ( ( read = in.read( buf ) ) != -1 )
++        {
++            out.write( buf, 0, read );
++        }
++        return out.toByteArray();
++    }
++
++    private static Node findUserParent(List<Node> userNodes, String path)
++    {
++        for ( Node n : userNodes )
++        {
++            if ( n.path.equals( path ) )
++            {
++                return n;
++            }
++        }
++        return null;
++    }
++
++    // ---- minimal indentation-based YAML outline ----
++
++    /** A mapping key together with the source span of its block. */
++    private static final class Node
++    {
++        final String path;     // dotted path, e.g. "antibot.reconnect.window-ms"
++        final String parent;   // dotted parent path, or null for top-level
++        final int indent;
++        final int leadStart;   // first line of the leading comment block (inclusive)
++        final int keyLine;     // the "key:" line
++        final int blockEnd;    // exclusive end of this key's value block
++
++        Node(String path, String parent, int indent, int leadStart, int keyLine, int blockEnd)
++        {
++            this.path = path;
++            this.parent = parent;
++            this.indent = indent;
++            this.leadStart = leadStart;
++            this.keyLine = keyLine;
++            this.blockEnd = blockEnd;
++        }
++
++        String root()
++        {
++            int dot = path.indexOf( '.' );
++            return dot < 0 ? path : path.substring( 0, dot );
++        }
++    }
++
++    private static List<Node> parse(List<String> lines)
++    {
++        List<Node> nodes = new ArrayList<>();
++        // Stack of (indent -> key) describing the current path.
++        List<int[]> indentStack = new ArrayList<>(); // each entry: {indent}
++        List<String> keyStack = new ArrayList<>();
++
++        for ( int i = 0; i < lines.size(); i++ )
++        {
++            String line = lines.get( i );
++            if ( isBlank( line ) || isComment( line ) )
++            {
++                continue;
++            }
++            int indent = indentOf( line );
++            String trimmed = line.trim();
++            if ( trimmed.startsWith( "-" ) )
++            {
++                continue; // list item, not a mapping key
++            }
++            int colon = indexOfKeyColon( trimmed );
++            if ( colon < 0 )
++            {
++                continue;
++            }
++            String key = trimmed.substring( 0, colon ).trim();
++            if ( key.isEmpty() )
++            {
++                continue;
++            }
++
++            // Pop deeper-or-equal frames to find this line's parent.
++            while ( !indentStack.isEmpty() && indentStack.get( indentStack.size() - 1 )[0] >= indent )
++            {
++                indentStack.remove( indentStack.size() - 1 );
++                keyStack.remove( keyStack.size() - 1 );
++            }
++            String parent = keyStack.isEmpty() ? null : String.join( ".", keyStack );
++            String path = parent == null ? key : parent + "." + key;
++
++            int leadStart = leadCommentStart( lines, i );
++            int blockEnd = blockEnd( lines, i, indent );
++            nodes.add( new Node( path, parent, indent, leadStart, i, blockEnd ) );
++
++            indentStack.add( new int[]{ indent } );
++            keyStack.add( key );
++        }
++        return nodes;
++    }
++
++    /** Index of the ':' that terminates a mapping key, ignoring ':' inside quotes. */
++    private static int indexOfKeyColon(String trimmed)
++    {
++        char quote = 0;
++        for ( int i = 0; i < trimmed.length(); i++ )
++        {
++            char c = trimmed.charAt( i );
++            if ( quote != 0 )
++            {
++                if ( c == quote )
++                {
++                    quote = 0;
++                }
++            } else if ( c == '"' || c == '\'' )
++            {
++                quote = c;
++            } else if ( c == ':' )
++            {
++                // A key colon is followed by end-of-line or whitespace.
++                if ( i + 1 >= trimmed.length() || trimmed.charAt( i + 1 ) == ' ' )
++                {
++                    return i;
++                }
++            }
++        }
++        return -1;
++    }
++
++    private static int leadCommentStart(List<String> lines, int keyLine)
++    {
++        int start = keyLine;
++        while ( start - 1 >= 0 && isComment( lines.get( start - 1 ) ) )
++        {
++            start--;
++        }
++        return start;
++    }
++
++    private static int blockEnd(List<String> lines, int keyLine, int indent)
++    {
++        int end = lines.size();
++        for ( int j = keyLine + 1; j < lines.size(); j++ )
++        {
++            String line = lines.get( j );
++            if ( isBlank( line ) || isComment( line ) )
++            {
++                continue;
++            }
++            if ( indentOf( line ) <= indent )
++            {
++                end = j;
++                break;
++            }
++        }
++        // Trim trailing blank/comment lines: they introduce the next sibling.
++        while ( end - 1 > keyLine && ( isBlank( lines.get( end - 1 ) ) || isComment( lines.get( end - 1 ) ) ) )
++        {
++            end--;
++        }
++        return end;
++    }
++
++    private static boolean isBlank(String line)
++    {
++        return line.trim().isEmpty();
++    }
++
++    private static boolean isComment(String line)
++    {
++        return line.trim().startsWith( "#" );
++    }
++
++    private static int indentOf(String line)
++    {
++        int i = 0;
++        while ( i < line.length() && line.charAt( i ) == ' ' )
++        {
++            i++;
++        }
++        return i;
++    }
++
++    /** A pending splice into the user's line list. */
++    private static final class Insertion
++    {
++        final int position;
++        final List<String> lines;
++        final boolean topLevel;
++
++        Insertion(int position, List<String> lines, boolean topLevel)
++        {
++            this.position = position;
++            this.lines = lines;
++            this.topLevel = topLevel;
++        }
++    }
++}
+diff --git a/proxy/src/main/java/net/regksem/xwaterfall/conf/XWaterfallConfig.java b/proxy/src/main/java/net/regksem/xwaterfall/conf/XWaterfallConfig.java
+index c9011b23..b91bb8d2 100644
+--- a/proxy/src/main/java/net/regksem/xwaterfall/conf/XWaterfallConfig.java
++++ b/proxy/src/main/java/net/regksem/xwaterfall/conf/XWaterfallConfig.java
+@@ -15,11 +15,13 @@ import org.yaml.snakeyaml.error.YAMLException;
+ /**
+  * Loader for {@code xwaterfall.yml}, the XWaterfall-specific configuration file.
+  *
+- * <p>Unlike {@link net.md_5.bungee.conf.YamlConfig} this loader is strictly
+- * read-only: it never rewrites the file, so the comments shipped in the bundled
+- * default are preserved across restarts and version upgrades. When the file is
+- * absent the bundled default (with comments) is copied to disk; any keys missing
+- * from an existing file simply fall back to the supplied code defaults.
++ * <p>Reads are non-destructive: existing lines are never rewritten, so user
++ * edits and the comments shipped in the bundled default are preserved across
++ * restarts and version upgrades. When the file is absent the bundled default
++ * (with comments) is copied to disk. When it exists, {@link ConfigMigrator}
++ * appends any keys introduced by a newer version (with their documentation) so
++ * new options become visible; anything still missing falls back to the supplied
++ * code defaults.
+  */
+ public class XWaterfallConfig
+ {
+@@ -60,6 +62,10 @@ public class XWaterfallConfig
+             return; // Nothing to read; callers will use their defaults.
+         }
+ 
++        // Bring an older on-disk file up to date by appending any keys this
++        // version added (with their documentation), before we read it.
++        ConfigMigrator.migrate( file.toPath(), FILE_NAME, ProxyServer.getInstance().getLogger() );
++
+         try ( InputStream is = new FileInputStream( file ) )
+         {
+             Map<String, Object> loaded = new Yaml().load( is );
+-- 
+2.50.1 (Apple Git-155)
+
