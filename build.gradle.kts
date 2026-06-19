@@ -15,7 +15,7 @@ fill {
 
         downloads {
             register("server:default") {
-                file = file("Waterfall-Proxy/bootstrap/target/Waterfall.jar")
+                file = file("Waterfall-Proxy/bootstrap/target/XWaterfall.jar")
                 nameResolver.set { project, _, version, build -> "$project-$version-$build.jar" }
             }
             for (module in listOf("cmd_alert", "cmd_find", "cmd_kick", "cmd_list", "cmd_send", "cmd_server", "reconnect_yaml")) {

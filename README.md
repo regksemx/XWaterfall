@@ -26,7 +26,7 @@ cd XWaterfall
 ./waterfall b
 ```
 
-The built jar is at `Waterfall-Proxy/bootstrap/target/Waterfall.jar`.
+The built jar is at `Waterfall-Proxy/bootstrap/target/XWaterfall.jar`.
 
 > This repo is patch-based: real source is the `BungeeCord/` submodule plus the
 > patch series in `BungeeCord-Patches/`. Run `./waterfall` with no arguments to
