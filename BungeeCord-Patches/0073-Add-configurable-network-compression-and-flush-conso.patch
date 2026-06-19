@@ -1,0 +1,230 @@
+From 205b8edc21115a86047541562b6d1c36f0dfdbad Mon Sep 17 00:00:00 2001
+From: regksem <regksem@tuta.io>
+Date: Fri, 19 Jun 2026 19:15:59 +0300
+Subject: [PATCH] Add configurable network compression and flush consolidation
+
+Adds xwaterfall.yml options to choose the network compression backend
+(ZLIB native zlib-ng / JAVA) and deflate level, plus a consolidate-flushes
+toggle that installs a Netty FlushConsolidationHandler on each pipeline.
+
+diff --git a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
+index 92a91fcd..4b5b4d95 100644
+--- a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
++++ b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
+@@ -103,6 +103,11 @@ public class WaterfallConfiguration extends Configuration {
+         this.motdFavicon = MotdManager.loadFavicon(
+                 xConfig.getString("motd.favicon-path", "server-icon.png"),
+                 xConfig.getDouble("motd.favicon-compression-level", 0.0D));
++
++        // Network compression
++        compressionType = xConfig.getString("compression.network.type", compressionType);
++        compressionLevel = xConfig.getInt("compression.network.level", compressionLevel);
++        consolidateFlushes = xConfig.getBoolean("consolidate-flushes", consolidateFlushes);
+     }
+ 
+     /**
+diff --git a/proxy/src/main/java/net/md_5/bungee/compress/CompressFactory.java b/proxy/src/main/java/net/md_5/bungee/compress/CompressFactory.java
+index e4cbbeb7..35b30248 100644
+--- a/proxy/src/main/java/net/md_5/bungee/compress/CompressFactory.java
++++ b/proxy/src/main/java/net/md_5/bungee/compress/CompressFactory.java
+@@ -1,5 +1,6 @@
+ package net.md_5.bungee.compress;
+ 
++import net.md_5.bungee.BungeeCord;
+ import net.md_5.bungee.jni.NativeCode;
+ import net.md_5.bungee.jni.zlib.BungeeZlib;
+ import net.md_5.bungee.jni.zlib.JavaZlib;
+@@ -9,4 +10,21 @@ public class CompressFactory
+ {
+ 
+     public static final NativeCode<BungeeZlib> zlib = new NativeCode<>( "native-compress", JavaZlib::new, NativeZlib::new, true );
++
++    // XWaterfall start - honour the configured compression type (xwaterfall.yml)
++    /**
++     * Creates a {@link BungeeZlib} instance honouring the configured
++     * {@code compression.network.type}. "JAVA" forces the pure-Java deflater;
++     * any other value (e.g. "ZLIB") uses the bundled native zlib-ng, which
++     * itself falls back to Java when natives are unavailable.
++     */
++    public static BungeeZlib newZlib()
++    {
++        if ( "JAVA".equalsIgnoreCase( BungeeCord.getInstance().config.getCompressionType() ) )
++        {
++            return new JavaZlib();
++        }
++        return zlib.newInstance();
++    }
++    // XWaterfall end
+ }
+diff --git a/proxy/src/main/java/net/md_5/bungee/compress/PacketDecompressor.java b/proxy/src/main/java/net/md_5/bungee/compress/PacketDecompressor.java
+index 7fa07031..35a65bf9 100644
+--- a/proxy/src/main/java/net/md_5/bungee/compress/PacketDecompressor.java
++++ b/proxy/src/main/java/net/md_5/bungee/compress/PacketDecompressor.java
+@@ -17,7 +17,7 @@ public class PacketDecompressor extends MessageToMessageDecoder<ByteBuf>
+ 
+     private static final int MAX_DECOMPRESSED_LEN = 1 << 23;
+     private final int compressionThreshold;
+-    private final BungeeZlib zlib = CompressFactory.zlib.newInstance();
++    private final BungeeZlib zlib = CompressFactory.newZlib(); // XWaterfall - honour configured compression type
+ 
+     @Override
+     public void handlerAdded(ChannelHandlerContext ctx) throws Exception
+diff --git a/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java b/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
+index 19f1295d..ff37b6fc 100644
+--- a/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
++++ b/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
+@@ -105,6 +105,27 @@ public abstract class Configuration implements ProxyConfig
+      */
+     protected int motdMaxPlayers = -1;
+     // XWaterfall end
++    // XWaterfall start - configurable network compression (loaded from xwaterfall.yml)
++    /**
++     * Compression backend used for the network packet stream. "ZLIB" uses the
++     * bundled native zlib-ng (transparently falling back to the pure-Java
++     * deflater when natives are unavailable), "JAVA" always forces the
++     * pure-Java deflater. Both produce a standard zlib stream, so the choice is
++     * purely a local performance trade-off and remains wire-compatible.
++     */
++    protected String compressionType = "ZLIB";
++    /**
++     * Deflate level (1-9) applied to outgoing compressed packets, or -1 for the
++     * zlib default. Closer to 9 means smaller packets at a higher CPU cost.
++     */
++    protected int compressionLevel = -1;
++    /**
++     * Coalesce Netty flushes on connection pipelines to avoid expensive flush
++     * syscalls under load, at the cost of very rare slight latency. Disabled by
++     * default.
++     */
++    protected boolean consolidateFlushes = false;
++    // XWaterfall end
+     private Favicon favicon;
+     private int compressionThreshold = 256;
+     private boolean preventProxyConnections;
+diff --git a/proxy/src/main/java/net/md_5/bungee/netty/LengthPrependerAndCompressor.java b/proxy/src/main/java/net/md_5/bungee/netty/LengthPrependerAndCompressor.java
+index 817bb1c0..420e3cf5 100644
+--- a/proxy/src/main/java/net/md_5/bungee/netty/LengthPrependerAndCompressor.java
++++ b/proxy/src/main/java/net/md_5/bungee/netty/LengthPrependerAndCompressor.java
+@@ -6,6 +6,7 @@ import io.netty.handler.codec.MessageToMessageEncoder;
+ import java.util.List;
+ import java.util.zip.Deflater;
+ import lombok.Setter;
++import net.md_5.bungee.BungeeCord;
+ import net.md_5.bungee.compress.CompressFactory;
+ import net.md_5.bungee.jni.zlib.BungeeZlib;
+ import net.md_5.bungee.protocol.DefinedPacket;
+@@ -149,9 +150,9 @@ public class LengthPrependerAndCompressor extends MessageToMessageEncoder<ByteBu
+             BungeeZlib zlib = this.zlib;
+             if ( zlib == null )
+             {
+-                this.zlib = zlib = CompressFactory.zlib.newInstance();
++                this.zlib = zlib = CompressFactory.newZlib(); // XWaterfall - honour configured compression type
+             }
+-            zlib.init( true, Deflater.DEFAULT_COMPRESSION );
++            zlib.init( true, compressionLevel( BungeeCord.getInstance().config.getCompressionLevel() ) ); // XWaterfall - configurable level
+             flags |= FLAG_COMPRESS;
+         } else
+         {
+@@ -175,6 +176,25 @@ public class LengthPrependerAndCompressor extends MessageToMessageEncoder<ByteBu
+         }
+     }
+ 
++    // XWaterfall start - clamp the configured deflate level to a value zlib accepts
++    private static int compressionLevel(int level)
++    {
++        if ( level == Deflater.DEFAULT_COMPRESSION )
++        {
++            return Deflater.DEFAULT_COMPRESSION;
++        }
++        if ( level < Deflater.BEST_SPEED )
++        {
++            return Deflater.BEST_SPEED; // 1
++        }
++        if ( level > Deflater.BEST_COMPRESSION )
++        {
++            return Deflater.BEST_COMPRESSION; // 9
++        }
++        return level;
++    }
++    // XWaterfall end
++
+     private static byte varintSize(int value)
+     {
+         if ( ( value & 0xFFFFFF80 ) == 0 )
+diff --git a/proxy/src/main/java/net/md_5/bungee/netty/PipelineUtils.java b/proxy/src/main/java/net/md_5/bungee/netty/PipelineUtils.java
+index 937c0028..903408c6 100644
+--- a/proxy/src/main/java/net/md_5/bungee/netty/PipelineUtils.java
++++ b/proxy/src/main/java/net/md_5/bungee/netty/PipelineUtils.java
+@@ -29,6 +29,7 @@ import io.netty.channel.uring.IoUringIoHandler;
+ import io.netty.channel.uring.IoUringServerSocketChannel;
+ import io.netty.channel.uring.IoUringSocketChannel;
+ import io.netty.handler.codec.haproxy.HAProxyMessageDecoder;
++import io.netty.handler.flush.FlushConsolidationHandler; // XWaterfall - configurable flush consolidation
+ import io.netty.handler.timeout.ReadTimeoutHandler;
+ import io.netty.handler.timeout.WriteTimeoutHandler;
+ import io.netty.util.AttributeKey;
+@@ -146,6 +147,7 @@ public class PipelineUtils
+     public static final String FRAME_PREPENDER_AND_COMPRESS = "frame-prepender-compress";
+     public static final String LEGACY_DECODER = "legacy-decoder";
+     public static final String LEGACY_KICKER = "legacy-kick";
++    public static final String FLUSH_CONSOLIDATION_HANDLER = "flush-consolidation"; // XWaterfall
+ 
+     private static boolean epoll;
+     private static boolean io_uring;
+@@ -282,6 +284,13 @@ public class PipelineUtils
+             ch.config().setOption( ChannelOption.TCP_NODELAY, true );
+             ch.config().setWriteBufferWaterMark( MARK );
+ 
++            // XWaterfall start - coalesce flushes to avoid expensive flush syscalls under load.
++            // Added first so it sits closest to the socket and consolidates flushes from all downstream handlers.
++            if ( BungeeCord.getInstance().config.isConsolidateFlushes() )
++            {
++                ch.pipeline().addLast( FLUSH_CONSOLIDATION_HANDLER, new FlushConsolidationHandler( FlushConsolidationHandler.DEFAULT_EXPLICIT_FLUSH_AFTER_FLUSHES, true ) );
++            }
++            // XWaterfall end
+             ch.pipeline().addLast( FRAME_DECODER, new Varint21FrameDecoder() );
+             ch.pipeline().addLast( TIMEOUT_HANDLER, new ReadTimeoutHandler( BungeeCord.getInstance().config.getTimeout(), TimeUnit.MILLISECONDS ) );
+             ch.pipeline().addLast( WRITE_TIMEOUT_HANDLER, new WriteTimeoutHandler( BungeeCord.getInstance().config.getTimeout(), TimeUnit.MILLISECONDS ) );
+diff --git a/proxy/src/main/resources/xwaterfall.yml b/proxy/src/main/resources/xwaterfall.yml
+index 54467f9f..062a20c7 100644
+--- a/proxy/src/main/resources/xwaterfall.yml
++++ b/proxy/src/main/resources/xwaterfall.yml
+@@ -82,3 +82,35 @@ motd:
+ 
+     # Maximum number of players shown in the ping.
+     max-players: 100
++
++# ---------------------------------------------------------------------------
++#  Network compression
++# ---------------------------------------------------------------------------
++# Which compression backend and deflate level to use for the network packet
++# stream sent between the proxy and clients/backends.
++#
++# Available types:
++# - "ZLIB": Uses the bundled native zlib-ng (faster than the JDK deflater).
++#           Native acceleration only kicks in on Linux amd64/aarch64; on every
++#           other platform it transparently falls back to the Java backend.
++# - "JAVA": Always uses the standard JDK deflater. Pick this if a plugin swaps
++#           in its own (de)compression handlers and the native path causes
++#           trouble.
++# Both backends emit a standard zlib stream, so the choice is purely a local
++# CPU trade-off and stays wire-compatible with vanilla clients/servers.
++#
++# Level: 1-9 (closer to 9 = smaller packets, more CPU), or -1 for the zlib
++# default. Out-of-range values are clamped into 1-9.
++compression:
++  network:
++    type: "ZLIB"
++    level: -1
++
++# ---------------------------------------------------------------------------
++#  Flush consolidation
++# ---------------------------------------------------------------------------
++# Coalesce Netty flushes on connection pipelines so the proxy issues fewer
++# expensive flush syscalls under load (e.g. when many players are clustered
++# together or one player receives a burst of packets). This can noticeably cut
++# CPU usage at the cost of very rare, slight added latency. Disabled by default.
++consolidate-flushes: false
+-- 
+2.50.1 (Apple Git-155)
+
