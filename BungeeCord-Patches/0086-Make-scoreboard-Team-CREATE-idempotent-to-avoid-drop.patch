@@ -1,0 +1,35 @@
+From afa25e375ba1673970781f3594ffd538ae30c44b Mon Sep 17 00:00:00 2001
+From: regksem <regksem@tuta.io>
+Date: Sat, 20 Jun 2026 05:10:29 +0300
+Subject: [PATCH] Make scoreboard Team CREATE idempotent to avoid dropping the
+ connection
+
+A backend server may send a Team packet with mode 0 (CREATE) for a team
+name that already exists in the player's server-sent scoreboard (NPC
+plugins reusing names, packet duplication). Scoreboard.addTeam then
+throws IllegalArgumentException, which propagates out of DownstreamBridge
+and tears down the server connection. Remove any existing team with the
+same name before re-creating it so a duplicate CREATE simply replaces it.
+
+diff --git a/proxy/src/main/java/net/md_5/bungee/connection/DownstreamBridge.java b/proxy/src/main/java/net/md_5/bungee/connection/DownstreamBridge.java
+index 79dd4563..77407977 100644
+--- a/proxy/src/main/java/net/md_5/bungee/connection/DownstreamBridge.java
++++ b/proxy/src/main/java/net/md_5/bungee/connection/DownstreamBridge.java
+@@ -286,8 +286,14 @@ public class DownstreamBridge extends PacketHandler
+         Team t;
+         if ( team.getMode() == 0 )
+         {
++            // XWaterfall start - a backend may resend a CREATE for a team name that
++            // already exists (NPC plugins reusing team names, packet duplication).
++            // Replace the existing team instead of letting Scoreboard.addTeam throw,
++            // which would otherwise bubble up and drop the server connection.
++            serverScoreboard.removeTeam( team.getName() );
+             t = new Team( team.getName() );
+             serverScoreboard.addTeam( t );
++            // XWaterfall end
+         } else
+         {
+             t = serverScoreboard.getTeam( team.getName() );
+-- 
+2.50.1 (Apple Git-155)
+
