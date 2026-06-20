@@ -1,0 +1,45 @@
+From 73901be6371a505ec8a53781d671cae43bcddcc3 Mon Sep 17 00:00:00 2001
+From: regksem <regksem@tuta.io>
+Date: Sat, 20 Jun 2026 14:41:45 +0300
+Subject: [PATCH] Relocate bundled net.kyori (Adventure) into a private package
+
+The MOTD / kick-message support bundles Adventure, MiniMessage and
+net.kyori:option unrelocated. BungeeCord's plugin classloader delegates to the
+proxy app classloader first, so this copy overrides and clashes with the
+Adventure that plugins (auth plugins and other net.kyori users) ship - the same
+failure mode the option 1.1.0 pin already worked around. Shade-relocate
+net.kyori to net.regksem.xwaterfall.libs.kyori so our copy is fully private, and
+add the ServicesResourceTransformer so Adventure's ServiceLoader providers still
+resolve. Only MotdManager uses net.kyori and nothing in the public API exposes
+it, so the relocation is internal-only.
+
+diff --git a/bootstrap/pom.xml b/bootstrap/pom.xml
+index 83ada99e..f5f50f39 100644
+--- a/bootstrap/pom.xml
++++ b/bootstrap/pom.xml
+@@ -197,8 +197,22 @@
+                             </excludes>
+                         </filter>
+                     </filters>
++                    <!-- Relocate the bundled net.kyori (Adventure / MiniMessage / option) into a
++                         private package. BungeeCord's plugin classloader delegates to this app
++                         classloader first, so an unrelocated copy here would override and clash
++                         with the Adventure a plugin (e.g. an auth plugin, or any net.kyori user)
++                         ships. Relocating keeps our copy fully private. Only MotdManager uses it. -->
++                    <relocations>
++                        <relocation>
++                            <pattern>net.kyori</pattern>
++                            <shadedPattern>net.regksem.xwaterfall.libs.kyori</shadedPattern>
++                        </relocation>
++                    </relocations>
+                     <transformers>
+                         <transformer implementation="com.github.edwgiz.maven_shade_plugin.log4j2_cache_transformer.PluginsCacheFileTransformer" />
++                        <!-- Relocate the names and contents of Adventure's META-INF/services
++                             provider files so its ServiceLoader lookups still resolve. -->
++                        <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer" />
+                     </transformers>
+                 </configuration>
+                 <dependencies>
+-- 
+2.50.1 (Apple Git-155)
+

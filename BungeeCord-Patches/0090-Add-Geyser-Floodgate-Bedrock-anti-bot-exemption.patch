@@ -1,0 +1,399 @@
+From 6bf08313b1069cf4129cd408bb5449be7ce244ad Mon Sep 17 00:00:00 2001
+From: regksem <regksem@tuta.io>
+Date: Sat, 20 Jun 2026 14:38:39 +0300
+Subject: [PATCH] Add Geyser/Floodgate (Bedrock) anti-bot exemption
+
+Geyser proxies Bedrock players to the proxy as ordinary Java connections,
+so the connection-level anti-bot and anti-exploit checks produce false
+positives for them. Add net.regksem.xwaterfall.antibot.BedrockDetector,
+which recognises such connections via Geyser's local pipeline handler,
+Floodgate's channel marker (read once by reflection) and an optional
+trusted-address list, and skips the gating checks for them:
+
+- handshake protocol gating and direct-IP blocking;
+- login name pattern, per-IP cap, reconnect firewall and join-rate counting;
+- the liveness (ClientSettings deadline) check;
+- the single-packet size cap in HandlerBoss.
+
+In-game limits (chat/command spam, tab-complete length) still apply. Gated by
+antibot.bedrock.exempt (default true) with antibot.bedrock.trusted-addresses in
+xwaterfall.yml; re-resolved on /xwaterfall antibot reload.
+
+diff --git a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
+index fa42d71a..a92f8914 100644
+--- a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
++++ b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
+@@ -232,6 +232,10 @@ public class WaterfallConfiguration extends Configuration {
+         net.regksem.xwaterfall.antibot.AntiBot.setLiveness(
+                 xConfig.getBoolean("antibot.liveness.enabled", false),
+                 xConfig.getInt("antibot.liveness.timeout-ms", 5000));
++        // Geyser/Floodgate (Bedrock) exemption from the connection-gating checks.
++        net.regksem.xwaterfall.antibot.BedrockDetector.setExempt(xConfig.getBoolean("antibot.bedrock.exempt", true));
++        net.regksem.xwaterfall.antibot.BedrockDetector.setTrustedAddresses(xConfig.getStringList("antibot.bedrock.trusted-addresses", java.util.Collections.emptyList()));
++        net.regksem.xwaterfall.antibot.BedrockDetector.resetDetection();
+         net.regksem.xwaterfall.antibot.AntiBot.setMessages(
+                 xConfig.getString("antibot.messages.reconnect", null),
+                 xConfig.getString("antibot.messages.name", null),
+diff --git a/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java b/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java
+index 458198f2..c14c95d2 100644
+--- a/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java
++++ b/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java
+@@ -460,8 +460,11 @@ public class InitialHandler extends PacketHandler implements PendingConnection
+                     return;
+                 }
+ 
+-                // XWaterfall - refuse explicitly disabled protocol versions
+-                if ( BungeeCord.getInstance().config.isProtocolDisabled( handshake.getProtocolVersion() ) )
++                // XWaterfall - Geyser/Floodgate (Bedrock) players bypass the connection-gating checks below
++                boolean bedrock = net.regksem.xwaterfall.antibot.BedrockDetector.isBedrock( ch.getHandle() );
++
++                // XWaterfall - refuse explicitly disabled protocol versions (not for Bedrock: Geyser spoofs a Java protocol)
++                if ( !bedrock && BungeeCord.getInstance().config.isProtocolDisabled( handshake.getProtocolVersion() ) )
+                 {
+                     disconnect( bungee.getTranslation( "outdated_client", bungee.getGameVersion() ) );
+                     return;
+@@ -473,8 +476,8 @@ public class InitialHandler extends PacketHandler implements PendingConnection
+                     return;
+                 }
+ 
+-                // XWaterfall - anti-bot: under attack, refuse raw-IP joins (legit players use the domain)
+-                if ( net.regksem.xwaterfall.antibot.AntiBot.blocksDirectIp( handshake.getHost() ) )
++                // XWaterfall - anti-bot: under attack, refuse raw-IP joins (legit players use the domain; never for Bedrock)
++                if ( !bedrock && net.regksem.xwaterfall.antibot.AntiBot.blocksDirectIp( handshake.getHost() ) )
+                 {
+                     disconnect( net.regksem.xwaterfall.antibot.AntiBot.directIpMessage() );
+                     return;
+@@ -496,13 +499,19 @@ public class InitialHandler extends PacketHandler implements PendingConnection
+             return;
+         }
+ 
+-        // XWaterfall - anti-bot: rate tracking + name / per-IP / reconnect checks
+-        net.regksem.xwaterfall.antibot.AntiBot.recordJoinAttempt();
+-        net.regksem.xwaterfall.antibot.AntiBot.Result antiBot = net.regksem.xwaterfall.antibot.AntiBot.checkLogin( getSocketAddress(), loginRequest.getData() );
+-        if ( antiBot != net.regksem.xwaterfall.antibot.AntiBot.Result.ALLOW )
++        // XWaterfall - anti-bot rate tracking + name / per-IP / reconnect checks. Skipped for
++        // Geyser/Floodgate (Bedrock) players: their prefixed usernames, shared Geyser source
++        // address and reconnect behaviour trip these heuristics, and counting their joins could
++        // falsely flip the proxy into "under attack" mode for everyone else.
++        if ( !net.regksem.xwaterfall.antibot.BedrockDetector.isBedrock( ch.getHandle() ) )
+         {
+-            disconnect( net.regksem.xwaterfall.antibot.AntiBot.message( antiBot ) );
+-            return;
++            net.regksem.xwaterfall.antibot.AntiBot.recordJoinAttempt();
++            net.regksem.xwaterfall.antibot.AntiBot.Result antiBot = net.regksem.xwaterfall.antibot.AntiBot.checkLogin( getSocketAddress(), loginRequest.getData() );
++            if ( antiBot != net.regksem.xwaterfall.antibot.AntiBot.Result.ALLOW )
++            {
++                disconnect( net.regksem.xwaterfall.antibot.AntiBot.message( antiBot ) );
++                return;
++            }
+         }
+ 
+         if ( BungeeCord.getInstance().config.isEnforceSecureProfile() && getVersion() < ProtocolConstants.MINECRAFT_1_19_3 )
+@@ -729,8 +738,10 @@ public class InitialHandler extends PacketHandler implements PendingConnection
+ 
+         ch.getHandle().pipeline().get( HandlerBoss.class ).setHandler( new UpstreamBridge( bungee, userCon ) );
+ 
+-        // XWaterfall - anti-bot liveness: under attack, require ClientSettings within the deadline
+-        if ( net.regksem.xwaterfall.antibot.AntiBot.shouldCheckLiveness() )
++        // XWaterfall - anti-bot liveness: under attack, require ClientSettings within the deadline.
++        // Bedrock (Geyser/Floodgate) clients deliver their settings differently, so they are exempt.
++        if ( net.regksem.xwaterfall.antibot.AntiBot.shouldCheckLiveness()
++                && !net.regksem.xwaterfall.antibot.BedrockDetector.isBedrock( ch.getHandle() ) )
+         {
+             final UserConnection livenessUser = userCon;
+             ch.getHandle().eventLoop().schedule( () ->
+diff --git a/proxy/src/main/java/net/md_5/bungee/netty/HandlerBoss.java b/proxy/src/main/java/net/md_5/bungee/netty/HandlerBoss.java
+index 9cb1981e..82c3f73d 100644
+--- a/proxy/src/main/java/net/md_5/bungee/netty/HandlerBoss.java
++++ b/proxy/src/main/java/net/md_5/bungee/netty/HandlerBoss.java
+@@ -132,9 +132,11 @@ public class HandlerBoss extends ChannelInboundHandlerAdapter
+                 return;
+             }
+ 
+-            // XWaterfall - drop connections sending oversized single packets
++            // XWaterfall - drop connections sending oversized single packets. Bedrock (Geyser/Floodgate)
++            // connections are exempt: Floodgate's appended login payload is legitimately large.
+             int maxPacketBytes = net.md_5.bungee.BungeeCord.getInstance().config.getMaxPacketBytes();
+-            if ( maxPacketBytes > 0 && packet.buf.readableBytes() > maxPacketBytes )
++            if ( maxPacketBytes > 0 && packet.buf.readableBytes() > maxPacketBytes
++                    && !net.regksem.xwaterfall.antibot.BedrockDetector.isBedrock( channel.getHandle() ) )
+             {
+                 channel.close();
+                 return;
+diff --git a/proxy/src/main/java/net/regksem/xwaterfall/antibot/BedrockDetector.java b/proxy/src/main/java/net/regksem/xwaterfall/antibot/BedrockDetector.java
+new file mode 100644
+index 00000000..69f4d098
+--- /dev/null
++++ b/proxy/src/main/java/net/regksem/xwaterfall/antibot/BedrockDetector.java
+@@ -0,0 +1,243 @@
++package net.regksem.xwaterfall.antibot;
++
++import com.google.common.collect.Multimap;
++import io.netty.channel.Channel;
++import io.netty.util.AttributeKey;
++import java.lang.reflect.Field;
++import java.net.InetAddress;
++import java.net.InetSocketAddress;
++import java.net.SocketAddress;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.Set;
++import net.md_5.bungee.BungeeCord;
++import net.md_5.bungee.api.plugin.Listener;
++import net.md_5.bungee.api.plugin.Plugin;
++import net.md_5.bungee.api.plugin.PluginManager;
++
++/**
++ * Detects Bedrock Edition players arriving through Geyser/Floodgate so the
++ * anti-bot and anti-exploit gates can exempt them.
++ *
++ * <p>Geyser proxies a Bedrock client to the proxy as an ordinary Java
++ * connection, so the connection-level heuristics (username shape, per-IP caps,
++ * raw-IP blocking, reconnect / liveness verification, protocol gating, single
++ * packet size caps) all produce false positives for Bedrock players. The
++ * in-game limits (chat / command spam, tab-complete length) are left in place;
++ * those engage on actual behaviour and are harmless to Bedrock players.
++ *
++ * <p>Everything here is best-effort and reflection-based: the proxy core never
++ * compiles against Geyser or Floodgate. If those plugins are absent, or their
++ * internals change, detection simply degrades to "not bedrock" and the gates
++ * apply as usual. The whole thing is gated by {@link #exempt}; when off the
++ * detector always returns {@code false}.
++ *
++ * <p>Two signals are used, mirroring how Geyser/Floodgate tag their channels:
++ * <ul>
++ *   <li>Geyser-BungeeCord installs a pipeline handler named
++ *       {@value #GEYSER_COMPRESSION_DISABLER} on the local connections it opens
++ *       for Bedrock players - a reflection-free, reliable marker.</li>
++ *   <li>Floodgate stores a {@code FloodgatePlayer} under a private
++ *       {@link AttributeKey} on the channel once it has identified a Bedrock
++ *       player; the key is read once via reflection and cached.</li>
++ * </ul>
++ * Plus an optional operator-supplied {@link #trustedAddresses} list for the
++ * source address of a standalone Geyser instance.
++ */
++public final class BedrockDetector
++{
++
++    private BedrockDetector()
++    {
++    }
++
++    /** Pipeline handler Geyser-BungeeCord adds to the local connections it opens. */
++    private static final String GEYSER_COMPRESSION_DISABLER = "geyser-compression-disabler";
++    /** Private field on Floodgate's Bungee listener holding the channel marker key. */
++    private static final String FLOODGATE_ATTRIBUTE_FIELD = "playerAttribute";
++
++    private static volatile boolean exempt = true;
++    private static volatile Set<String> trustedAddresses = Collections.emptySet();
++
++    // Lazily-resolved Floodgate channel attribute key (resolved on first use).
++    private static volatile AttributeKey<?> floodgateKey;
++    private static volatile boolean floodgateResolved; // true once resolution has been attempted
++
++    public static boolean isExempt()
++    {
++        return exempt;
++    }
++
++    public static void setExempt(boolean value)
++    {
++        exempt = value;
++    }
++
++    public static void setTrustedAddresses(Collection<String> addresses)
++    {
++        Set<String> set = new HashSet<>();
++        if ( addresses != null )
++        {
++            for ( String address : addresses )
++            {
++                if ( address != null && !address.trim().isEmpty() )
++                {
++                    set.add( address.trim() );
++                }
++            }
++        }
++        trustedAddresses = set;
++    }
++
++    /**
++     * Re-arms lazy Floodgate resolution. Called when the anti-bot config is
++     * (re)loaded so a Floodgate plugin enabled/replaced at runtime is picked up
++     * on the next connection.
++     */
++    public static void resetDetection()
++    {
++        floodgateResolved = false;
++        floodgateKey = null;
++    }
++
++    /**
++     * @return true if this connection belongs to a Geyser/Floodgate (Bedrock)
++     *         player and should bypass the connection-gating checks
++     */
++    public static boolean isBedrock(Channel channel)
++    {
++        if ( !exempt || channel == null )
++        {
++            return false;
++        }
++        if ( isGeyserLocal( channel ) )
++        {
++            return true;
++        }
++        if ( isFloodgate( channel ) )
++        {
++            return true;
++        }
++        return !trustedAddresses.isEmpty() && isTrustedAddress( channel.remoteAddress() );
++    }
++
++    private static boolean isGeyserLocal(Channel channel)
++    {
++        try
++        {
++            return channel.pipeline().get( GEYSER_COMPRESSION_DISABLER ) != null;
++        } catch ( Exception ex )
++        {
++            return false;
++        }
++    }
++
++    private static boolean isFloodgate(Channel channel)
++    {
++        AttributeKey<?> key = floodgateKey;
++        if ( key == null )
++        {
++            if ( floodgateResolved )
++            {
++                return false;
++            }
++            key = resolveFloodgateKey();
++            if ( key == null )
++            {
++                return false;
++            }
++        }
++        try
++        {
++            return channel.attr( key ).get() != null;
++        } catch ( Exception ex )
++        {
++            return false;
++        }
++    }
++
++    private static boolean isTrustedAddress(SocketAddress address)
++    {
++        if ( address instanceof InetSocketAddress )
++        {
++            InetAddress addr = ( (InetSocketAddress) address ).getAddress();
++            if ( addr != null )
++            {
++                return trustedAddresses.contains( addr.getHostAddress() );
++            }
++        }
++        return false;
++    }
++
++    /**
++     * Reads the private {@code playerAttribute} {@link AttributeKey} from
++     * Floodgate's Bungee listener - the key Floodgate sets on a channel once it
++     * has identified a Bedrock player. Resolution is attempted at most once per
++     * config (re)load; any failure leaves the key null and detection falls back
++     * to the Geyser handler / trusted-address list.
++     */
++    private static synchronized AttributeKey<?> resolveFloodgateKey()
++    {
++        if ( floodgateResolved )
++        {
++            return floodgateKey;
++        }
++        floodgateResolved = true;
++        try
++        {
++            PluginManager pluginManager = BungeeCord.getInstance().getPluginManager();
++            Plugin floodgate = pluginManager.getPlugin( "floodgate" );
++            if ( floodgate == null )
++            {
++                return null;
++            }
++            for ( Listener listener : listenersOf( pluginManager, floodgate ) )
++            {
++                Field field = findField( listener.getClass(), FLOODGATE_ATTRIBUTE_FIELD );
++                if ( field == null )
++                {
++                    continue;
++                }
++                field.setAccessible( true );
++                Object value = field.get( listener );
++                if ( value instanceof AttributeKey )
++                {
++                    floodgateKey = (AttributeKey<?>) value;
++                    BungeeCord.getInstance().getLogger().info(
++                            "[XWaterfall] Floodgate detected; Bedrock players will bypass anti-bot connection checks." );
++                    return floodgateKey;
++                }
++            }
++        } catch ( Throwable ignored )
++        {
++            // Best-effort: any failure leaves floodgateKey null (no false positives).
++        }
++        return null;
++    }
++
++    /** Reads the registered listeners for a plugin via the private PluginManager map. */
++    @SuppressWarnings("unchecked")
++    private static Collection<Listener> listenersOf(PluginManager pluginManager, Plugin plugin) throws Exception
++    {
++        Field field = PluginManager.class.getDeclaredField( "listenersByPlugin" );
++        field.setAccessible( true );
++        Multimap<Plugin, Listener> map = (Multimap<Plugin, Listener>) field.get( pluginManager );
++        return map.get( plugin );
++    }
++
++    private static Field findField(Class<?> type, String name)
++    {
++        for ( Class<?> c = type; c != null && c != Object.class; c = c.getSuperclass() )
++        {
++            try
++            {
++                return c.getDeclaredField( name );
++            } catch ( NoSuchFieldException ignored )
++            {
++                // walk up the hierarchy
++            }
++        }
++        return null;
++    }
++}
+diff --git a/proxy/src/main/resources/xwaterfall.yml b/proxy/src/main/resources/xwaterfall.yml
+index 8279edb6..f159d817 100644
+--- a/proxy/src/main/resources/xwaterfall.yml
++++ b/proxy/src/main/resources/xwaterfall.yml
+@@ -257,6 +257,20 @@ antibot:
+     enabled: false
+     timeout-ms: 5000
+ 
++  # Geyser / Floodgate (Bedrock) compatibility. Geyser proxies Bedrock players to
++  # the proxy as ordinary Java connections, so the connection checks above
++  # (username pattern, per-IP cap, direct-IP block, reconnect & liveness checks)
++  # as well as protocol gating and antiexploit.max-packet-bytes would wrongly
++  # reject them. When "exempt" is on, connections identified as Geyser/Floodgate
++  # skip those gates - they remain subject to the in-game limits (chat/command
++  # spam and tab-complete length). Detection is automatic: Geyser's local
++  # pipeline handler and Floodgate's channel marker. If you run a *standalone*
++  # Geyser (a separate process, not a plugin on this proxy), add its source IP to
++  # trusted-addresses so its players are recognised too.
++  bedrock:
++    exempt: true
++    trusted-addresses: []
++
+   # Kick messages. Each supports the full colour pipeline (auto-detected):
+   # MiniMessage (RGB, <gradient>, <#hex>) by default, or legacy '&' / section
+   # codes incl. hex when those are present. Use {NL} for a new line. Messages are
+-- 
+2.50.1 (Apple Git-155)
+
