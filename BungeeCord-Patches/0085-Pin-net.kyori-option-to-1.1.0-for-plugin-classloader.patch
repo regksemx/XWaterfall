@@ -1,0 +1,54 @@
+From a8b95fdf42e38fb332f11bbe4a289af57e0b1af5 Mon Sep 17 00:00:00 2001
+From: regksem <regksem@tuta.io>
+Date: Sat, 20 Jun 2026 05:01:10 +0300
+Subject: [PATCH] Pin net.kyori:option to 1.1.0 for plugin classloader
+ compatibility
+
+Adventure 4.17.0 only pulls net.kyori:option 1.0.0, which lacks
+OptionSchema/OptionSchemaImpl. Plugins bundling a newer Configurate
+load OptionSchemaImpl from their own class loader while OptionStateImpl
+resolves to the proxy's app-loaded 1.0.0 copy, and the cross-loader
+package-private access throws IllegalAccessError, taking the proxy down
+when an auth plugin treats its failed enable as fatal. Shipping option
+1.1.0 keeps every net.kyori.option class on the app class loader.
+
+diff --git a/proxy/pom.xml b/proxy/pom.xml
+index 21ee1131..0261bd56 100644
+--- a/proxy/pom.xml
++++ b/proxy/pom.xml
+@@ -144,6 +144,11 @@
+                     <groupId>com.google.code.gson</groupId>
+                     <artifactId>gson</artifactId>
+                 </exclusion>
++                <!-- Drop the transitive option 1.0.0; we ship 1.1.0 directly below -->
++                <exclusion>
++                    <groupId>net.kyori</groupId>
++                    <artifactId>option</artifactId>
++                </exclusion>
+             </exclusions>
+         </dependency>
+         <dependency>
+@@ -173,6 +178,20 @@
+                 </exclusion>
+             </exclusions>
+         </dependency>
++        <!-- Pin net.kyori:option to 1.1.0. Adventure 4.17.0 only pulls option
++             1.0.0, which has no OptionSchema/OptionSchemaImpl. Plugins that bundle
++             a newer Configurate expect those classes; with only 1.0.0 on the proxy
++             class path, OptionSchemaImpl loads from the plugin's class loader while
++             OptionStateImpl resolves to the proxy's app-loaded copy, so the
++             cross-loader package-private access fails with IllegalAccessError.
++             Shipping 1.1.0 keeps every net.kyori.option class on the app class
++             loader, where they stay mutually accessible. -->
++        <dependency>
++            <groupId>net.kyori</groupId>
++            <artifactId>option</artifactId>
++            <version>1.1.0</version>
++            <scope>compile</scope>
++        </dependency>
+         <!-- XWaterfall end -->
+         <dependency>
+             <groupId>com.mysql</groupId>
+-- 
+2.50.1 (Apple Git-155)
+
