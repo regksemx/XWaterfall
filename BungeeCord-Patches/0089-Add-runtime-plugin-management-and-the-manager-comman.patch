@@ -1,0 +1,696 @@
+From 81366298b6634d9b30fe3973ad15e9126f96678c Mon Sep 17 00:00:00 2001
+From: regksem <regksem@tuta.io>
+Date: Sat, 20 Jun 2026 14:07:35 +0300
+Subject: [PATCH] Add runtime plugin management and the /manager command
+
+Adds a PlugMan-style /manager command (alias /plugman) to load, unload, reload,
+enable, disable and inspect plugins and modules at runtime, backed by new
+PluginManager API: loadPlugin(File), unloadPlugin/reloadPlugin/disablePlugin/
+enablePlugin(Plugin) and isPluginEnabled(Plugin).
+
+Unloading disables the plugin, cancels its scheduled tasks, shuts down its
+executor, unregisters its commands and listeners, drops it from the dependency
+graph and closes its class loader. PluginClassloader.close() now also removes
+itself from the shared loader set so an unloaded plugin's classes stop resolving
+for other plugins, and Plugin gains a package-private shutdownExecutorService().
+
+diff --git a/api/src/main/java/net/md_5/bungee/api/plugin/Plugin.java b/api/src/main/java/net/md_5/bungee/api/plugin/Plugin.java
+index 4c56ae55..ef8cc7a2 100644
+--- a/api/src/main/java/net/md_5/bungee/api/plugin/Plugin.java
++++ b/api/src/main/java/net/md_5/bungee/api/plugin/Plugin.java
+@@ -150,5 +150,16 @@ public class Plugin
+         }
+         return service;
+     }
++
++    // XWaterfall - shut down this plugin's executor when it is unloaded so its
++    // threads do not outlive the plugin.
++    final void shutdownExecutorService()
++    {
++        if ( service != null )
++        {
++            service.shutdownNow();
++            service = null;
++        }
++    }
+     //
+ }
+diff --git a/api/src/main/java/net/md_5/bungee/api/plugin/PluginClassloader.java b/api/src/main/java/net/md_5/bungee/api/plugin/PluginClassloader.java
+index d746b68b..495c358a 100644
+--- a/api/src/main/java/net/md_5/bungee/api/plugin/PluginClassloader.java
++++ b/api/src/main/java/net/md_5/bungee/api/plugin/PluginClassloader.java
+@@ -201,6 +201,9 @@ final class PluginClassloader extends URLClassLoader
+             super.close();
+         } finally
+         {
++            // XWaterfall - drop this loader from the shared set so an unloaded
++            // plugin's classes are no longer resolvable by other plugins.
++            allLoaders.remove( this );
+             jar.close();
+         }
+     }
+diff --git a/api/src/main/java/net/md_5/bungee/api/plugin/PluginManager.java b/api/src/main/java/net/md_5/bungee/api/plugin/PluginManager.java
+index 94dd956f..45c27766 100644
+--- a/api/src/main/java/net/md_5/bungee/api/plugin/PluginManager.java
++++ b/api/src/main/java/net/md_5/bungee/api/plugin/PluginManager.java
+@@ -8,6 +8,7 @@ import com.google.common.graph.GraphBuilder;
+ import com.google.common.graph.Graphs;
+ import com.google.common.graph.MutableGraph;
+ import java.io.File;
++import java.io.IOException;
+ import java.io.InputStream;
+ import java.lang.reflect.Method;
+ import java.net.URLClassLoader;
+@@ -69,6 +70,8 @@ public final class PluginManager
+     private Map<String, PluginDescription> toLoad = new HashMap<>();
+     private final Multimap<Plugin, Command> commandsByPlugin = ArrayListMultimap.create();
+     private final Multimap<Plugin, Listener> listenersByPlugin = ArrayListMultimap.create();
++    // XWaterfall - names of plugins soft-disabled at runtime via /manager
++    private final Set<String> disabledPlugins = new HashSet<>();
+ 
+     private final ReadWriteLock commandsLock = new ReentrantReadWriteLock();
+     private final Lock listenersLock = new ReentrantLock();
+@@ -561,6 +564,210 @@ public final class PluginManager
+         return Collections.unmodifiableCollection( commandMap.entrySet() );
+     }
+ 
++    // XWaterfall start - runtime plugin management for the /manager command
++
++    /**
++     * Loads, registers and enables a single plugin from the given jar at
++     * runtime. The jar must contain a {@code bungee.yml} or {@code plugin.yml}.
++     *
++     * @param file the plugin jar to load
++     * @return the loaded plugin
++     * @throws Exception if the jar has no descriptor, names an already-loaded
++     * plugin, or fails to enable
++     */
++    public Plugin loadPlugin(File file) throws Exception
++    {
++        Preconditions.checkNotNull( file, "file" );
++        Preconditions.checkArgument( file.isFile(), "%s is not a file", file );
++
++        PluginDescription desc = describePlugin( file );
++        Preconditions.checkNotNull( desc.getName(), "Plugin from %s has no name", file );
++        Preconditions.checkNotNull( desc.getMain(), "Plugin from %s has no main", file );
++        Preconditions.checkArgument( plugins.get( desc.getName() ) == null, "Plugin %s is already loaded", desc.getName() );
++
++        URLClassLoader loader = new PluginClassloader( proxy, desc, desc.getFile(), ( libraryLoader != null ) ? libraryLoader.createLoader( desc ) : null );
++        Class<?> main = loader.loadClass( desc.getMain() );
++        Plugin plugin = (Plugin) main.getDeclaredConstructor().newInstance();
++
++        plugins.put( desc.getName(), plugin );
++        try
++        {
++            plugin.onLoad();
++            plugin.onEnable();
++        } catch ( Throwable t )
++        {
++            // Roll back a half-loaded plugin so it can be retried cleanly.
++            proxy.getLogger().log( Level.WARNING, "Error enabling plugin " + desc.getName(), t );
++            unloadPlugin( plugin );
++            throw new IllegalStateException( "Could not enable plugin " + desc.getName(), t );
++        }
++        ProxyServer.getInstance().getLogger().log( Level.INFO, "Loaded plugin {0} version {1} by {2}", new Object[]
++        {
++            desc.getName(), desc.getVersion(), desc.getAuthor()
++        } );
++        return plugin;
++    }
++
++    /**
++     * Disables and fully unloads a plugin: its scheduled tasks, commands and
++     * listeners are removed, its executor is shut down and its class loader is
++     * closed. References the plugin leaked elsewhere (static caches, threads it
++     * started itself) cannot be reclaimed.
++     *
++     * @param plugin the plugin to unload
++     * @return true once unloaded
++     */
++    public boolean unloadPlugin(Plugin plugin)
++    {
++        Preconditions.checkNotNull( plugin, "plugin" );
++        String name = plugin.getDescription().getName();
++
++        try
++        {
++            plugin.onDisable();
++        } catch ( Throwable t )
++        {
++            proxy.getLogger().log( Level.WARNING, "Exception disabling plugin " + name, t );
++        }
++
++        proxy.getScheduler().cancel( plugin );
++        plugin.shutdownExecutorService();
++        unregisterCommands( plugin );
++        unregisterListeners( plugin );
++
++        plugins.remove( name );
++        disabledPlugins.remove( name );
++        if ( dependencyGraph.nodes().contains( name ) )
++        {
++            dependencyGraph.removeNode( name );
++        }
++
++        ClassLoader loader = plugin.getClass().getClassLoader();
++        if ( loader instanceof PluginClassloader )
++        {
++            try
++            {
++                ( (PluginClassloader) loader ).close();
++            } catch ( IOException ex )
++            {
++                proxy.getLogger().log( Level.WARNING, "Could not close class loader for plugin " + name, ex );
++            }
++        }
++        return true;
++    }
++
++    /**
++     * Unloads and then loads the plugin again from its jar on disk.
++     *
++     * @param plugin the plugin to reload
++     * @return the freshly loaded plugin
++     * @throws Exception if loading the plugin again fails
++     */
++    public Plugin reloadPlugin(Plugin plugin) throws Exception
++    {
++        Preconditions.checkNotNull( plugin, "plugin" );
++        File file = plugin.getDescription().getFile();
++        unloadPlugin( plugin );
++        return loadPlugin( file );
++    }
++
++    /**
++     * Soft-disables a loaded plugin: it stays loaded but its tasks, commands and
++     * listeners are removed and {@link Plugin#onDisable()} is called. Use
++     * {@link #enablePlugin(Plugin)} to bring it back.
++     *
++     * @param plugin the plugin to disable
++     */
++    public void disablePlugin(Plugin plugin)
++    {
++        Preconditions.checkNotNull( plugin, "plugin" );
++        String name = plugin.getDescription().getName();
++        if ( disabledPlugins.contains( name ) )
++        {
++            return;
++        }
++        try
++        {
++            plugin.onDisable();
++        } catch ( Throwable t )
++        {
++            proxy.getLogger().log( Level.WARNING, "Exception disabling plugin " + name, t );
++        }
++        proxy.getScheduler().cancel( plugin );
++        unregisterCommands( plugin );
++        unregisterListeners( plugin );
++        disabledPlugins.add( name );
++    }
++
++    /**
++     * Re-enables a plugin previously soft-disabled with
++     * {@link #disablePlugin(Plugin)} by calling {@link Plugin#onEnable()} again.
++     *
++     * @param plugin the plugin to enable
++     */
++    public void enablePlugin(Plugin plugin)
++    {
++        Preconditions.checkNotNull( plugin, "plugin" );
++        String name = plugin.getDescription().getName();
++        if ( !disabledPlugins.contains( name ) )
++        {
++            return;
++        }
++        disabledPlugins.remove( name );
++        try
++        {
++            plugin.onEnable();
++        } catch ( Throwable t )
++        {
++            proxy.getLogger().log( Level.WARNING, "Exception enabling plugin " + name, t );
++        }
++    }
++
++    /**
++     * Whether the given plugin is currently enabled (loaded and not
++     * soft-disabled).
++     *
++     * @param plugin the plugin to query
++     * @return true if enabled
++     */
++    public boolean isPluginEnabled(Plugin plugin)
++    {
++        return plugin != null && !disabledPlugins.contains( plugin.getDescription().getName() );
++    }
++
++    /**
++     * Returns a copy of the commands registered by the given plugin.
++     *
++     * @param plugin the owning plugin
++     * @return the plugin's registered commands
++     */
++    @Locked.Read("commandsLock")
++    public Collection<Command> getCommands(Plugin plugin)
++    {
++        return new java.util.ArrayList<>( commandsByPlugin.get( plugin ) );
++    }
++
++    private PluginDescription describePlugin(File file) throws Exception
++    {
++        try ( JarFile jar = new JarFile( file ) )
++        {
++            JarEntry pdf = jar.getJarEntry( "bungee.yml" );
++            if ( pdf == null )
++            {
++                pdf = jar.getJarEntry( "plugin.yml" );
++            }
++            Preconditions.checkNotNull( pdf, "Plugin must have a plugin.yml or bungee.yml" );
++
++            try ( InputStream in = jar.getInputStream( pdf ) )
++            {
++                PluginDescription desc = yaml.loadAs( in, PluginDescription.class );
++                desc.setFile( file );
++                return desc;
++            }
++        }
++    }
++    // XWaterfall end
++
+     boolean isTransitiveDepend(PluginDescription plugin, PluginDescription depend)
+     {
+         Preconditions.checkArgument( plugin != null, "plugin" );
+diff --git a/proxy/src/main/java/net/md_5/bungee/BungeeCord.java b/proxy/src/main/java/net/md_5/bungee/BungeeCord.java
+index 35a8ddeb..2996f746 100644
+--- a/proxy/src/main/java/net/md_5/bungee/BungeeCord.java
++++ b/proxy/src/main/java/net/md_5/bungee/BungeeCord.java
+@@ -234,6 +234,7 @@ public class BungeeCord extends ProxyServer
+         getPluginManager().registerCommand( null, new CommandBungee() );
+         getPluginManager().registerCommand( null, new CommandPerms() );
+         getPluginManager().registerCommand( null, new net.regksem.xwaterfall.command.CommandXWaterfall() ); // XWaterfall
++        getPluginManager().registerCommand( null, new net.regksem.xwaterfall.command.CommandManager() ); // XWaterfall
+ 
+         if ( !Boolean.getBoolean( "net.md_5.bungee.native.disable" ) )
+         {
+diff --git a/proxy/src/main/java/net/regksem/xwaterfall/command/CommandManager.java b/proxy/src/main/java/net/regksem/xwaterfall/command/CommandManager.java
+new file mode 100644
+index 00000000..6c28cb5c
+--- /dev/null
++++ b/proxy/src/main/java/net/regksem/xwaterfall/command/CommandManager.java
+@@ -0,0 +1,392 @@
++package net.regksem.xwaterfall.command;
++
++import java.io.File;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Locale;
++import java.util.Set;
++import net.md_5.bungee.api.ChatColor;
++import net.md_5.bungee.api.CommandSender;
++import net.md_5.bungee.api.ProxyServer;
++import net.md_5.bungee.api.plugin.Command;
++import net.md_5.bungee.api.plugin.Plugin;
++import net.md_5.bungee.api.plugin.PluginManager;
++import net.md_5.bungee.api.plugin.TabExecutor;
++
++/**
++ * PlugMan-style runtime management of plugins and modules. Modules are simply
++ * plugins loaded from the {@code modules/} folder, so both are managed the same
++ * way.
++ *
++ * <p>{@code /manager list [plugins|modules]}, {@code info <name>},
++ * {@code load <jar>}, {@code unload <name>}, {@code reload <name>},
++ * {@code enable <name>} and {@code disable <name>}.</p>
++ *
++ * <p>Unloading tears down everything the proxy tracks for a plugin (commands,
++ * listeners, scheduled tasks, executor and class loader); a plugin that leaks
++ * its own references may still not unload completely.</p>
++ */
++public class CommandManager extends Command implements TabExecutor
++{
++
++    private static final String[] SUBCOMMANDS =
++    {
++        "list", "info", "load", "unload", "reload", "enable", "disable"
++    };
++
++    public CommandManager()
++    {
++        super( "manager", "bungeecord.command.manager", "plugman" );
++    }
++
++    private static PluginManager pm()
++    {
++        return ProxyServer.getInstance().getPluginManager();
++    }
++
++    @Override
++    public void execute(CommandSender sender, String[] args)
++    {
++        if ( args.length == 0 )
++        {
++            usage( sender );
++            return;
++        }
++
++        String sub = args[0].toLowerCase( Locale.ROOT );
++        switch ( sub )
++        {
++            case "list":
++                list( sender, ( args.length > 1 ) ? args[1].toLowerCase( Locale.ROOT ) : "all" );
++                return;
++            case "info":
++                requireName( sender, args, this::info );
++                return;
++            case "load":
++                requireName( sender, args, this::load );
++                return;
++            case "unload":
++                requireName( sender, args, this::unload );
++                return;
++            case "reload":
++                requireName( sender, args, this::reload );
++                return;
++            case "enable":
++                requireName( sender, args, this::enable );
++                return;
++            case "disable":
++                requireName( sender, args, this::disable );
++                return;
++            default:
++                usage( sender );
++        }
++    }
++
++    private interface NameAction
++    {
++        void run(CommandSender sender, String name);
++    }
++
++    private void requireName(CommandSender sender, String[] args, NameAction action)
++    {
++        if ( args.length < 2 )
++        {
++            sender.sendMessage( ChatColor.RED + "Usage: /manager " + args[0].toLowerCase( Locale.ROOT ) + " <name>" );
++            return;
++        }
++        action.run( sender, args[1] );
++    }
++
++    private void usage(CommandSender sender)
++    {
++        sender.sendMessage( ChatColor.GOLD + "/manager " + ChatColor.GRAY + "- manage plugins and modules" );
++        sender.sendMessage( ChatColor.YELLOW + "  list [plugins|modules]" + ChatColor.GRAY + " - list loaded plugins/modules" );
++        sender.sendMessage( ChatColor.YELLOW + "  info <name>" + ChatColor.GRAY + " - show details about a plugin" );
++        sender.sendMessage( ChatColor.YELLOW + "  load <jar>" + ChatColor.GRAY + " - load a jar from plugins/ or modules/" );
++        sender.sendMessage( ChatColor.YELLOW + "  unload <name>" + ChatColor.GRAY + " - unload a plugin" );
++        sender.sendMessage( ChatColor.YELLOW + "  reload <name>" + ChatColor.GRAY + " - unload and load a plugin again" );
++        sender.sendMessage( ChatColor.YELLOW + "  enable|disable <name>" + ChatColor.GRAY + " - toggle a loaded plugin" );
++    }
++
++    private void list(CommandSender sender, String filter)
++    {
++        boolean wantModules = filter.startsWith( "mod" );
++        boolean wantPlugins = filter.startsWith( "plug" );
++        boolean all = !wantModules && !wantPlugins;
++
++        List<String> entries = new ArrayList<>();
++        for ( Plugin plugin : pm().getPlugins() )
++        {
++            boolean module = isModule( plugin );
++            if ( !all && ( module != wantModules ) )
++            {
++                continue;
++            }
++            ChatColor state = pm().isPluginEnabled( plugin ) ? ChatColor.GREEN : ChatColor.RED;
++            String tag = module ? ChatColor.AQUA + "[M]" : ChatColor.BLUE + "[P]";
++            entries.add( tag + " " + state + plugin.getDescription().getName() );
++        }
++
++        String header = all ? "Plugins & modules" : ( wantModules ? "Modules" : "Plugins" );
++        sender.sendMessage( ChatColor.GOLD + header + " (" + entries.size() + "):" );
++        if ( entries.isEmpty() )
++        {
++            sender.sendMessage( ChatColor.GRAY + "  (none)" );
++            return;
++        }
++        sender.sendMessage( ChatColor.GRAY + "  " + String.join( ChatColor.GRAY + ", ", entries ) );
++    }
++
++    private void info(CommandSender sender, String name)
++    {
++        Plugin plugin = find( name );
++        if ( plugin == null )
++        {
++            notFound( sender, name );
++            return;
++        }
++        sender.sendMessage( ChatColor.GOLD + "===== " + plugin.getDescription().getName() + " =====" );
++        sender.sendMessage( ChatColor.YELLOW + "Version: " + ChatColor.WHITE + plugin.getDescription().getVersion() );
++        sender.sendMessage( ChatColor.YELLOW + "Author: " + ChatColor.WHITE + plugin.getDescription().getAuthor() );
++        if ( plugin.getDescription().getDescription() != null )
++        {
++            sender.sendMessage( ChatColor.YELLOW + "Description: " + ChatColor.WHITE + plugin.getDescription().getDescription() );
++        }
++        sender.sendMessage( ChatColor.YELLOW + "Type: " + ChatColor.WHITE + ( isModule( plugin ) ? "module" : "plugin" ) );
++        sender.sendMessage( ChatColor.YELLOW + "State: " + ( pm().isPluginEnabled( plugin ) ? ChatColor.GREEN + "enabled" : ChatColor.RED + "disabled" ) );
++        sender.sendMessage( ChatColor.YELLOW + "File: " + ChatColor.WHITE + plugin.getDescription().getFile().getName() );
++
++        Collection<Command> commands = pm().getCommands( plugin );
++        if ( !commands.isEmpty() )
++        {
++            Set<String> names = new HashSet<>();
++            for ( Command command : commands )
++            {
++                names.add( command.getName() );
++            }
++            sender.sendMessage( ChatColor.YELLOW + "Commands: " + ChatColor.WHITE + String.join( ", ", names ) );
++        }
++    }
++
++    private void load(CommandSender sender, String name)
++    {
++        File file = resolveJar( name );
++        if ( file == null )
++        {
++            sender.sendMessage( ChatColor.RED + "No jar named '" + name + "' found in plugins/ or modules/." );
++            return;
++        }
++        try
++        {
++            Plugin plugin = pm().loadPlugin( file );
++            sender.sendMessage( ChatColor.GREEN + "Loaded and enabled " + plugin.getDescription().getName() + "." );
++        } catch ( Throwable t )
++        {
++            sender.sendMessage( ChatColor.RED + "Could not load " + file.getName() + ": " + rootMessage( t ) );
++            ProxyServer.getInstance().getLogger().warning( "Failed to load plugin " + file + " via /manager: " + rootMessage( t ) );
++        }
++    }
++
++    private void unload(CommandSender sender, String name)
++    {
++        Plugin plugin = find( name );
++        if ( plugin == null )
++        {
++            notFound( sender, name );
++            return;
++        }
++        String display = plugin.getDescription().getName();
++        pm().unloadPlugin( plugin );
++        sender.sendMessage( ChatColor.GREEN + "Unloaded " + display + "." );
++    }
++
++    private void reload(CommandSender sender, String name)
++    {
++        Plugin plugin = find( name );
++        if ( plugin == null )
++        {
++            notFound( sender, name );
++            return;
++        }
++        String display = plugin.getDescription().getName();
++        try
++        {
++            Plugin reloaded = pm().reloadPlugin( plugin );
++            sender.sendMessage( ChatColor.GREEN + "Reloaded " + reloaded.getDescription().getName() + "." );
++        } catch ( Throwable t )
++        {
++            sender.sendMessage( ChatColor.RED + display + " was unloaded but could not be loaded again: " + rootMessage( t ) );
++            ProxyServer.getInstance().getLogger().warning( "Failed to reload plugin " + display + " via /manager: " + rootMessage( t ) );
++        }
++    }
++
++    private void enable(CommandSender sender, String name)
++    {
++        Plugin plugin = find( name );
++        if ( plugin == null )
++        {
++            notFound( sender, name );
++            return;
++        }
++        if ( pm().isPluginEnabled( plugin ) )
++        {
++            sender.sendMessage( ChatColor.RED + plugin.getDescription().getName() + " is already enabled." );
++            return;
++        }
++        pm().enablePlugin( plugin );
++        sender.sendMessage( ChatColor.GREEN + "Enabled " + plugin.getDescription().getName() + "." );
++    }
++
++    private void disable(CommandSender sender, String name)
++    {
++        Plugin plugin = find( name );
++        if ( plugin == null )
++        {
++            notFound( sender, name );
++            return;
++        }
++        if ( !pm().isPluginEnabled( plugin ) )
++        {
++            sender.sendMessage( ChatColor.RED + plugin.getDescription().getName() + " is already disabled." );
++            return;
++        }
++        pm().disablePlugin( plugin );
++        sender.sendMessage( ChatColor.GREEN + "Disabled " + plugin.getDescription().getName() + "." );
++    }
++
++    private static Plugin find(String name)
++    {
++        for ( Plugin plugin : pm().getPlugins() )
++        {
++            if ( plugin.getDescription().getName().equalsIgnoreCase( name ) )
++            {
++                return plugin;
++            }
++        }
++        return null;
++    }
++
++    private static boolean isModule(Plugin plugin)
++    {
++        File file = plugin.getDescription().getFile();
++        File parent = ( file == null ) ? null : file.getParentFile();
++        return parent != null && "modules".equalsIgnoreCase( parent.getName() );
++    }
++
++    private static File resolveJar(String name)
++    {
++        String jarName = name.toLowerCase( Locale.ROOT ).endsWith( ".jar" ) ? name : name + ".jar";
++        File[] folders =
++        {
++            ProxyServer.getInstance().getPluginsFolder(), new File( "modules" )
++        };
++        for ( File folder : folders )
++        {
++            if ( folder == null || !folder.isDirectory() )
++            {
++                continue;
++            }
++            File candidate = new File( folder, jarName );
++            if ( candidate.isFile() )
++            {
++                return candidate;
++            }
++        }
++        return null;
++    }
++
++    private static String rootMessage(Throwable t)
++    {
++        Throwable cause = t;
++        while ( cause.getCause() != null && cause.getCause() != cause )
++        {
++            cause = cause.getCause();
++        }
++        String message = cause.getMessage();
++        return ( message == null ) ? cause.getClass().getSimpleName() : message;
++    }
++
++    private static void notFound(CommandSender sender, String name)
++    {
++        sender.sendMessage( ChatColor.RED + "No plugin or module named '" + name + "' is loaded." );
++    }
++
++    @Override
++    public Iterable<String> onTabComplete(CommandSender sender, String[] args)
++    {
++        Set<String> matches = new HashSet<>();
++        if ( args.length == 1 )
++        {
++            String search = args[0].toLowerCase( Locale.ROOT );
++            for ( String sub : SUBCOMMANDS )
++            {
++                if ( sub.startsWith( search ) )
++                {
++                    matches.add( sub );
++                }
++            }
++            return matches;
++        }
++        if ( args.length == 2 )
++        {
++            String sub = args[0].toLowerCase( Locale.ROOT );
++            String search = args[1].toLowerCase( Locale.ROOT );
++            if ( sub.equals( "list" ) )
++            {
++                for ( String option : new String[]
++                {
++                    "plugins", "modules"
++                } )
++                {
++                    if ( option.startsWith( search ) )
++                    {
++                        matches.add( option );
++                    }
++                }
++            } else if ( sub.equals( "load" ) )
++            {
++                collectJarNames( matches, search );
++            } else
++            {
++                for ( Plugin plugin : pm().getPlugins() )
++                {
++                    if ( plugin.getDescription().getName().toLowerCase( Locale.ROOT ).startsWith( search ) )
++                    {
++                        matches.add( plugin.getDescription().getName() );
++                    }
++                }
++            }
++        }
++        return matches;
++    }
++
++    private static void collectJarNames(Set<String> matches, String search)
++    {
++        File[] folders =
++        {
++            ProxyServer.getInstance().getPluginsFolder(), new File( "modules" )
++        };
++        for ( File folder : folders )
++        {
++            if ( folder == null || !folder.isDirectory() )
++            {
++                continue;
++            }
++            File[] files = folder.listFiles();
++            if ( files == null )
++            {
++                continue;
++            }
++            for ( File file : files )
++            {
++                if ( file.isFile() && file.getName().toLowerCase( Locale.ROOT ).endsWith( ".jar" )
++                        && file.getName().toLowerCase( Locale.ROOT ).startsWith( search ) )
++                {
++                    matches.add( file.getName() );
++                }
++            }
++        }
++    }
++}
+-- 
+2.50.1 (Apple Git-155)
+

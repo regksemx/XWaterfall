@@ -1,0 +1,964 @@
+From c254eeebcf6469874813178c84a11b531b904e76 Mon Sep 17 00:00:00 2001
+From: regksem <regksem@tuta.io>
+Date: Sat, 20 Jun 2026 14:02:04 +0300
+Subject: [PATCH] Add cmd_ban module with proxy-wide bans
+
+Adds a bundled command module providing /gban, /gtempban, /gunban and /gbanlist.
+Bans target a player name and, when the player is online, their last-known IP;
+both are checked on PreLoginEvent so banned players are denied entry, and online
+matches are kicked immediately. Temporary bans expire automatically and are
+pruned on load and lookup.
+
+State is persisted to bans.yml and the deny messages are configurable via
+config.yml, both in the module's data folder. The module is shipped inside the
+jar like the other command modules and enabled by default (modules.yml v4).
+
+diff --git a/bootstrap/pom.xml b/bootstrap/pom.xml
+index 1a948fec..83ada99e 100644
+--- a/bootstrap/pom.xml
++++ b/bootstrap/pom.xml
+@@ -46,6 +46,12 @@
+             <version>${project.version}</version>
+             <scope>provided</scope>
+         </dependency>
++        <dependency>
++            <groupId>io.github.waterfallmc</groupId>
++            <artifactId>waterfall-module-cmd-ban</artifactId>
++            <version>${project.version}</version>
++            <scope>provided</scope>
++        </dependency>
+         <dependency>
+             <groupId>io.github.waterfallmc</groupId>
+             <artifactId>waterfall-module-cmd-find</artifactId>
+@@ -104,6 +110,13 @@
+                                     <type>jar</type>
+                                     <destFileName>cmd_alert.jar</destFileName>
+                                 </artifactItem>
++                                <artifactItem>
++                                    <groupId>io.github.waterfallmc</groupId>
++                                    <artifactId>waterfall-module-cmd-ban</artifactId>
++                                    <version>${project.version}</version>
++                                    <type>jar</type>
++                                    <destFileName>cmd_ban.jar</destFileName>
++                                </artifactItem>
+                                 <artifactItem>
+                                     <groupId>io.github.waterfallmc</groupId>
+                                     <artifactId>waterfall-module-cmd-find</artifactId>
+diff --git a/module/cmd-ban/pom.xml b/module/cmd-ban/pom.xml
+new file mode 100644
+index 00000000..04a68794
+--- /dev/null
++++ b/module/cmd-ban/pom.xml
+@@ -0,0 +1,20 @@
++
++<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
++    <modelVersion>4.0.0</modelVersion>
++
++    <parent>
++        <groupId>io.github.waterfallmc</groupId>
++        <artifactId>waterfall-module</artifactId>
++        <version>26.1-R0.1-SNAPSHOT</version>
++        <relativePath>../pom.xml</relativePath>
++    </parent>
++
++    <groupId>io.github.waterfallmc</groupId>
++    <artifactId>waterfall-module-cmd-ban</artifactId>
++    <version>26.1-R0.1-SNAPSHOT</version>
++    <packaging>jar</packaging>
++
++    <name>cmd_ban</name>
++    <description>Provides the gban, gtempban, gunban and gbanlist commands</description>
++</project>
+diff --git a/module/cmd-ban/src/main/java/net/md_5/bungee/module/cmd/ban/BanEntry.java b/module/cmd-ban/src/main/java/net/md_5/bungee/module/cmd/ban/BanEntry.java
+new file mode 100644
+index 00000000..c612d809
+--- /dev/null
++++ b/module/cmd-ban/src/main/java/net/md_5/bungee/module/cmd/ban/BanEntry.java
+@@ -0,0 +1,73 @@
++package net.md_5.bungee.module.cmd.ban;
++
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++/**
++ * A single ban record. A ban always targets a player name and, when the player
++ * was online at ban time, also their last-known IP. {@link #expires} of zero (or
++ * negative) marks a permanent ban.
++ */
++final class BanEntry
++{
++
++    final String name;
++    final String ip;
++    final String reason;
++    final String source;
++    final long created;
++    final long expires;
++
++    BanEntry(String name, String ip, String reason, String source, long created, long expires)
++    {
++        this.name = name;
++        this.ip = ip;
++        this.reason = reason;
++        this.source = source;
++        this.created = created;
++        this.expires = expires;
++    }
++
++    boolean isPermanent()
++    {
++        return expires <= 0L;
++    }
++
++    boolean isExpired(long now)
++    {
++        return !isPermanent() && now >= expires;
++    }
++
++    Map<String, Object> serialize()
++    {
++        Map<String, Object> map = new LinkedHashMap<>();
++        map.put( "name", name );
++        map.put( "ip", ip );
++        map.put( "reason", reason );
++        map.put( "source", source );
++        map.put( "created", created );
++        map.put( "expires", expires );
++        return map;
++    }
++
++    static BanEntry deserialize(Map<?, ?> map)
++    {
++        String name = asString( map.get( "name" ) );
++        String ip = asString( map.get( "ip" ) );
++        String reason = asString( map.get( "reason" ) );
++        String source = asString( map.get( "source" ) );
++        long created = asLong( map.get( "created" ) );
++        long expires = asLong( map.get( "expires" ) );
++        return new BanEntry( name, ip, reason, source, created, expires );
++    }
++
++    private static String asString(Object value)
++    {
++        return ( value == null ) ? null : value.toString();
++    }
++
++    private static long asLong(Object value)
++    {
++        return ( value instanceof Number ) ? ( (Number) value ).longValue() : 0L;
++    }
++}
+diff --git a/module/cmd-ban/src/main/java/net/md_5/bungee/module/cmd/ban/BanListener.java b/module/cmd-ban/src/main/java/net/md_5/bungee/module/cmd/ban/BanListener.java
+new file mode 100644
+index 00000000..4bf603a0
+--- /dev/null
++++ b/module/cmd-ban/src/main/java/net/md_5/bungee/module/cmd/ban/BanListener.java
+@@ -0,0 +1,42 @@
++package net.md_5.bungee.module.cmd.ban;
++
++import java.net.InetSocketAddress;
++import net.md_5.bungee.api.chat.TextComponent;
++import net.md_5.bungee.api.event.PreLoginEvent;
++import net.md_5.bungee.api.plugin.Listener;
++import net.md_5.bungee.event.EventHandler;
++
++public class BanListener implements Listener
++{
++
++    private final BanManager bans;
++
++    public BanListener(BanManager bans)
++    {
++        this.bans = bans;
++    }
++
++    @EventHandler
++    public void onPreLogin(PreLoginEvent event)
++    {
++        if ( event.isCancelled() )
++        {
++            return;
++        }
++
++        String name = event.getConnection().getName();
++        String ip = null;
++        InetSocketAddress address = event.getConnection().getAddress();
++        if ( address != null && address.getAddress() != null )
++        {
++            ip = address.getAddress().getHostAddress();
++        }
++
++        BanEntry entry = bans.check( name, ip );
++        if ( entry != null )
++        {
++            event.setCancelled( true );
++            event.setReason( TextComponent.fromLegacy( bans.formatKickMessage( entry ) ) );
++        }
++    }
++}
+diff --git a/module/cmd-ban/src/main/java/net/md_5/bungee/module/cmd/ban/BanManager.java b/module/cmd-ban/src/main/java/net/md_5/bungee/module/cmd/ban/BanManager.java
+new file mode 100644
+index 00000000..be22dfa6
+--- /dev/null
++++ b/module/cmd-ban/src/main/java/net/md_5/bungee/module/cmd/ban/BanManager.java
+@@ -0,0 +1,382 @@
++package net.md_5.bungee.module.cmd.ban;
++
++import com.google.common.io.ByteStreams;
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.io.Reader;
++import java.io.Writer;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.TimeUnit;
++import java.util.logging.Level;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++import net.md_5.bungee.api.ChatColor;
++import net.md_5.bungee.api.plugin.Plugin;
++import org.yaml.snakeyaml.DumperOptions;
++import org.yaml.snakeyaml.Yaml;
++
++/**
++ * Loads, stores and queries the proxy-wide ban list. Bans are keyed by player
++ * name and, when known, by IP; both lookups are checked on login. State is
++ * persisted to {@code bans.yml} in the module's data folder and messages are
++ * read from {@code config.yml}.
++ */
++class BanManager
++{
++
++    private static final Pattern DURATION = Pattern.compile( "(\\d+)([smhdw])" );
++
++    private final Plugin plugin;
++    private final File banFile;
++    private final Yaml yaml;
++
++    private final Map<String, BanEntry> byName = new ConcurrentHashMap<>();
++    private final Map<String, BanEntry> byIp = new ConcurrentHashMap<>();
++
++    private String defaultReason = "Banned by an operator.";
++    private String permanentMessage = "&cYou are banned from this network.\\n&7Reason: &f{reason}";
++    private String temporaryMessage = "&cYou are temporarily banned from this network.\\n&7Reason: &f{reason}\\n&7Expires in: &f{expiry}";
++
++    BanManager(Plugin plugin)
++    {
++        this.plugin = plugin;
++
++        DumperOptions options = new DumperOptions();
++        options.setDefaultFlowStyle( DumperOptions.FlowStyle.BLOCK );
++        this.yaml = new Yaml( options );
++
++        plugin.getDataFolder().mkdirs();
++        this.banFile = new File( plugin.getDataFolder(), "bans.yml" );
++
++        loadConfig();
++        load();
++    }
++
++    private void loadConfig()
++    {
++        File configFile = new File( plugin.getDataFolder(), "config.yml" );
++        if ( !configFile.exists() )
++        {
++            try ( InputStream in = getClass().getClassLoader().getResourceAsStream( "config.yml" );
++                  OutputStream out = new FileOutputStream( configFile ) )
++            {
++                if ( in != null )
++                {
++                    ByteStreams.copy( in, out );
++                }
++            } catch ( IOException ex )
++            {
++                plugin.getLogger().log( Level.WARNING, "Could not write default ban config", ex );
++            }
++        }
++
++        try ( Reader rd = Files.newBufferedReader( configFile.toPath(), StandardCharsets.UTF_8 ) )
++        {
++            Map<?, ?> config = yaml.loadAs( rd, Map.class );
++            Object messages = ( config == null ) ? null : config.get( "messages" );
++            if ( messages instanceof Map )
++            {
++                Map<?, ?> m = (Map<?, ?>) messages;
++                defaultReason = string( m.get( "default-reason" ), defaultReason );
++                permanentMessage = string( m.get( "permanent" ), permanentMessage );
++                temporaryMessage = string( m.get( "temporary" ), temporaryMessage );
++            }
++        } catch ( IOException ex )
++        {
++            plugin.getLogger().log( Level.WARNING, "Could not read ban config", ex );
++        }
++    }
++
++    @SuppressWarnings("unchecked")
++    private synchronized void load()
++    {
++        byName.clear();
++        byIp.clear();
++
++        if ( !banFile.exists() )
++        {
++            return;
++        }
++
++        Map<?, ?> root;
++        try ( InputStream in = new FileInputStream( banFile ) )
++        {
++            root = yaml.loadAs( in, Map.class );
++        } catch ( IOException ex )
++        {
++            plugin.getLogger().log( Level.WARNING, "Could not read bans.yml", ex );
++            return;
++        }
++
++        if ( root == null )
++        {
++            return;
++        }
++        Object list = root.get( "bans" );
++        if ( !( list instanceof List ) )
++        {
++            return;
++        }
++
++        long now = System.currentTimeMillis();
++        boolean prunedAny = false;
++        for ( Object element : (List<Object>) list )
++        {
++            if ( !( element instanceof Map ) )
++            {
++                continue;
++            }
++            BanEntry entry = BanEntry.deserialize( (Map<?, ?>) element );
++            if ( entry.isExpired( now ) )
++            {
++                prunedAny = true;
++                continue;
++            }
++            index( entry );
++        }
++
++        if ( prunedAny )
++        {
++            save();
++        }
++    }
++
++    private void index(BanEntry entry)
++    {
++        if ( entry.name != null )
++        {
++            byName.put( entry.name.toLowerCase( Locale.ROOT ), entry );
++        }
++        if ( entry.ip != null )
++        {
++            byIp.put( entry.ip, entry );
++        }
++    }
++
++    synchronized void save()
++    {
++        Set<BanEntry> unique = new LinkedHashSet<>();
++        unique.addAll( byName.values() );
++        unique.addAll( byIp.values() );
++
++        List<Map<String, Object>> serialized = new ArrayList<>( unique.size() );
++        for ( BanEntry entry : unique )
++        {
++            serialized.add( entry.serialize() );
++        }
++
++        Map<String, Object> root = new LinkedHashMap<>();
++        root.put( "bans", serialized );
++
++        try ( Writer wr = Files.newBufferedWriter( banFile.toPath(), StandardCharsets.UTF_8 ) )
++        {
++            yaml.dump( root, wr );
++        } catch ( IOException ex )
++        {
++            plugin.getLogger().log( Level.WARNING, "Could not save bans.yml", ex );
++        }
++    }
++
++    /**
++     * Returns the active ban matching the given name or IP, pruning it first if
++     * it has expired. Either argument may be null.
++     */
++    synchronized BanEntry check(String name, String ip)
++    {
++        long now = System.currentTimeMillis();
++        BanEntry entry = null;
++        if ( name != null )
++        {
++            entry = byName.get( name.toLowerCase( Locale.ROOT ) );
++        }
++        if ( entry == null && ip != null )
++        {
++            entry = byIp.get( ip );
++        }
++        if ( entry != null && entry.isExpired( now ) )
++        {
++            remove( entry );
++            save();
++            return null;
++        }
++        return entry;
++    }
++
++    synchronized BanEntry getByName(String name)
++    {
++        return byName.get( name.toLowerCase( Locale.ROOT ) );
++    }
++
++    synchronized void addBan(BanEntry entry)
++    {
++        index( entry );
++        save();
++    }
++
++    /**
++     * Removes any ban targeting the given name or IP. Returns the removed entry,
++     * or null if nothing matched.
++     */
++    synchronized BanEntry removeTarget(String target)
++    {
++        BanEntry entry = byName.get( target.toLowerCase( Locale.ROOT ) );
++        if ( entry == null )
++        {
++            entry = byIp.get( target );
++        }
++        if ( entry == null )
++        {
++            return null;
++        }
++        remove( entry );
++        save();
++        return entry;
++    }
++
++    private void remove(BanEntry entry)
++    {
++        if ( entry.name != null )
++        {
++            byName.remove( entry.name.toLowerCase( Locale.ROOT ) );
++        }
++        if ( entry.ip != null )
++        {
++            byIp.remove( entry.ip );
++        }
++    }
++
++    synchronized Collection<BanEntry> activeBans()
++    {
++        long now = System.currentTimeMillis();
++        Set<BanEntry> unique = new LinkedHashSet<>();
++        for ( BanEntry entry : byName.values() )
++        {
++            if ( !entry.isExpired( now ) )
++            {
++                unique.add( entry );
++            }
++        }
++        for ( BanEntry entry : byIp.values() )
++        {
++            if ( !entry.isExpired( now ) )
++            {
++                unique.add( entry );
++            }
++        }
++        return unique;
++    }
++
++    String getDefaultReason()
++    {
++        return defaultReason;
++    }
++
++    /**
++     * Builds the legacy-coloured kick text shown to a denied player.
++     */
++    String formatKickMessage(BanEntry entry)
++    {
++        String template = entry.isPermanent() ? permanentMessage : temporaryMessage;
++        String expiry = entry.isPermanent() ? "never" : formatDuration( entry.expires - System.currentTimeMillis() );
++        String message = template
++                .replace( "{reason}", ( entry.reason == null ) ? defaultReason : entry.reason )
++                .replace( "{expiry}", expiry )
++                .replace( "{source}", ( entry.source == null ) ? "console" : entry.source )
++                .replace( "\\n", "\n" );
++        return ChatColor.translateAlternateColorCodes( '&', message );
++    }
++
++    private static String string(Object value, String fallback)
++    {
++        return ( value == null ) ? fallback : value.toString();
++    }
++
++    /**
++     * Parses a duration such as {@code 30m}, {@code 2h}, {@code 7d} or a
++     * combination like {@code 1d12h}. Returns -1 if nothing valid was found.
++     */
++    static long parseDuration(String input)
++    {
++        Matcher matcher = DURATION.matcher( input.toLowerCase( Locale.ROOT ) );
++        long total = 0L;
++        boolean matched = false;
++        int end = 0;
++        while ( matcher.find() )
++        {
++            if ( matcher.start() != end )
++            {
++                return -1L;
++            }
++            end = matcher.end();
++            matched = true;
++            long amount = Long.parseLong( matcher.group( 1 ) );
++            switch ( matcher.group( 2 ) )
++            {
++                case "s":
++                    total += TimeUnit.SECONDS.toMillis( amount );
++                    break;
++                case "m":
++                    total += TimeUnit.MINUTES.toMillis( amount );
++                    break;
++                case "h":
++                    total += TimeUnit.HOURS.toMillis( amount );
++                    break;
++                case "d":
++                    total += TimeUnit.DAYS.toMillis( amount );
++                    break;
++                case "w":
++                    total += TimeUnit.DAYS.toMillis( amount * 7L );
++                    break;
++                default:
++                    return -1L;
++            }
++        }
++        return ( matched && end == input.length() ) ? total : -1L;
++    }
++
++    static String formatDuration(long millis)
++    {
++        if ( millis <= 0L )
++        {
++            return "0s";
++        }
++        long seconds = millis / 1000L;
++        long days = seconds / 86400L;
++        long hours = ( seconds % 86400L ) / 3600L;
++        long minutes = ( seconds % 3600L ) / 60L;
++        long secs = seconds % 60L;
++
++        StringBuilder sb = new StringBuilder();
++        if ( days > 0L )
++        {
++            sb.append( days ).append( "d " );
++        }
++        if ( hours > 0L )
++        {
++            sb.append( hours ).append( "h " );
++        }
++        if ( minutes > 0L )
++        {
++            sb.append( minutes ).append( "m " );
++        }
++        if ( secs > 0L && days == 0L )
++        {
++            sb.append( secs ).append( "s" );
++        }
++        return sb.toString().trim();
++    }
++}
+diff --git a/module/cmd-ban/src/main/java/net/md_5/bungee/module/cmd/ban/CommandBan.java b/module/cmd-ban/src/main/java/net/md_5/bungee/module/cmd/ban/CommandBan.java
+new file mode 100644
+index 00000000..f2964e41
+--- /dev/null
++++ b/module/cmd-ban/src/main/java/net/md_5/bungee/module/cmd/ban/CommandBan.java
+@@ -0,0 +1,80 @@
++package net.md_5.bungee.module.cmd.ban;
++
++import com.google.common.base.Joiner;
++import com.google.common.collect.ImmutableSet;
++import java.util.HashSet;
++import java.util.Locale;
++import java.util.Set;
++import net.md_5.bungee.api.ChatColor;
++import net.md_5.bungee.api.CommandSender;
++import net.md_5.bungee.api.ProxyServer;
++import net.md_5.bungee.api.chat.TextComponent;
++import net.md_5.bungee.api.connection.ProxiedPlayer;
++import net.md_5.bungee.api.plugin.Command;
++import net.md_5.bungee.api.plugin.TabExecutor;
++
++public class CommandBan extends Command implements TabExecutor
++{
++
++    private final BanManager bans;
++
++    public CommandBan(BanManager bans)
++    {
++        super( "gban", "bungeecord.command.ban" );
++        this.bans = bans;
++    }
++
++    @Override
++    public void execute(CommandSender sender, String[] args)
++    {
++        if ( args.length == 0 )
++        {
++            sender.sendMessage( new TextComponent( ChatColor.RED + "Usage: /gban <player> [reason]" ) );
++            return;
++        }
++
++        String target = args[0];
++        String reason = ( args.length > 1 )
++                ? Joiner.on( ' ' ).join( java.util.Arrays.copyOfRange( args, 1, args.length ) )
++                : bans.getDefaultReason();
++
++        BanEntry existing = bans.getByName( target );
++        if ( existing != null && existing.isPermanent() )
++        {
++            sender.sendMessage( new TextComponent( ChatColor.RED + target + " is already banned." ) );
++            return;
++        }
++
++        ProxiedPlayer online = ProxyServer.getInstance().getPlayer( target );
++        String ip = ( online != null ) ? online.getAddress().getAddress().getHostAddress() : null;
++
++        BanEntry entry = new BanEntry( target, ip, reason, sender.getName(), System.currentTimeMillis(), 0L );
++        bans.addBan( entry );
++
++        if ( online != null )
++        {
++            online.disconnect( TextComponent.fromLegacy( bans.formatKickMessage( entry ) ) );
++        }
++
++        sender.sendMessage( new TextComponent( ChatColor.GREEN + "Permanently banned " + target + ". Reason: " + ChatColor.WHITE + reason ) );
++    }
++
++    @Override
++    public Iterable<String> onTabComplete(CommandSender sender, String[] args)
++    {
++        if ( args.length == 1 )
++        {
++            Set<String> matches = new HashSet<>();
++            String search = args[0].toLowerCase( Locale.ROOT );
++            for ( ProxiedPlayer player : ProxyServer.getInstance().getPlayers() )
++            {
++                if ( player.getName().toLowerCase( Locale.ROOT ).startsWith( search ) )
++                {
++                    matches.add( player.getName() );
++                }
++            }
++            return matches;
++        }
++        return ImmutableSet.of();
++    }
++}
+diff --git a/module/cmd-ban/src/main/java/net/md_5/bungee/module/cmd/ban/CommandBanList.java b/module/cmd-ban/src/main/java/net/md_5/bungee/module/cmd/ban/CommandBanList.java
+new file mode 100644
+index 00000000..e2c8785d
+--- /dev/null
++++ b/module/cmd-ban/src/main/java/net/md_5/bungee/module/cmd/ban/CommandBanList.java
+@@ -0,0 +1,44 @@
++package net.md_5.bungee.module.cmd.ban;
++
++import java.util.Collection;
++import net.md_5.bungee.api.ChatColor;
++import net.md_5.bungee.api.CommandSender;
++import net.md_5.bungee.api.chat.TextComponent;
++import net.md_5.bungee.api.plugin.Command;
++
++public class CommandBanList extends Command
++{
++
++    private final BanManager bans;
++
++    public CommandBanList(BanManager bans)
++    {
++        super( "gbanlist", "bungeecord.command.banlist" );
++        this.bans = bans;
++    }
++
++    @Override
++    public void execute(CommandSender sender, String[] args)
++    {
++        Collection<BanEntry> active = bans.activeBans();
++        if ( active.isEmpty() )
++        {
++            sender.sendMessage( new TextComponent( ChatColor.GREEN + "There are no active bans." ) );
++            return;
++        }
++
++        sender.sendMessage( new TextComponent( ChatColor.GOLD + "Active bans (" + active.size() + "):" ) );
++        long now = System.currentTimeMillis();
++        for ( BanEntry entry : active )
++        {
++            String who = ( entry.name != null ) ? entry.name : entry.ip;
++            String duration = entry.isPermanent()
++                    ? ChatColor.RED + "permanent"
++                    : ChatColor.YELLOW + BanManager.formatDuration( entry.expires - now ) + " left";
++            sender.sendMessage( new TextComponent( ChatColor.GRAY + " - " + ChatColor.WHITE + who
++                    + ChatColor.GRAY + " (" + duration + ChatColor.GRAY + ") "
++                    + ChatColor.GRAY + "by " + ( entry.source == null ? "console" : entry.source )
++                    + ChatColor.GRAY + ": " + ChatColor.WHITE + ( entry.reason == null ? "" : entry.reason ) ) );
++        }
++    }
++}
+diff --git a/module/cmd-ban/src/main/java/net/md_5/bungee/module/cmd/ban/CommandTempBan.java b/module/cmd-ban/src/main/java/net/md_5/bungee/module/cmd/ban/CommandTempBan.java
+new file mode 100644
+index 00000000..f2a3bbe6
+--- /dev/null
++++ b/module/cmd-ban/src/main/java/net/md_5/bungee/module/cmd/ban/CommandTempBan.java
+@@ -0,0 +1,84 @@
++package net.md_5.bungee.module.cmd.ban;
++
++import com.google.common.base.Joiner;
++import com.google.common.collect.ImmutableSet;
++import java.util.Arrays;
++import java.util.HashSet;
++import java.util.Locale;
++import java.util.Set;
++import net.md_5.bungee.api.ChatColor;
++import net.md_5.bungee.api.CommandSender;
++import net.md_5.bungee.api.ProxyServer;
++import net.md_5.bungee.api.chat.TextComponent;
++import net.md_5.bungee.api.connection.ProxiedPlayer;
++import net.md_5.bungee.api.plugin.Command;
++import net.md_5.bungee.api.plugin.TabExecutor;
++
++public class CommandTempBan extends Command implements TabExecutor
++{
++
++    private final BanManager bans;
++
++    public CommandTempBan(BanManager bans)
++    {
++        super( "gtempban", "bungeecord.command.tempban" );
++        this.bans = bans;
++    }
++
++    @Override
++    public void execute(CommandSender sender, String[] args)
++    {
++        if ( args.length < 2 )
++        {
++            sender.sendMessage( new TextComponent( ChatColor.RED + "Usage: /gtempban <player> <duration> [reason]" ) );
++            sender.sendMessage( new TextComponent( ChatColor.GRAY + "Duration examples: 30m, 2h, 7d, 1d12h" ) );
++            return;
++        }
++
++        String target = args[0];
++        long duration = BanManager.parseDuration( args[1] );
++        if ( duration <= 0L )
++        {
++            sender.sendMessage( new TextComponent( ChatColor.RED + "Invalid duration '" + args[1] + "'. Use e.g. 30m, 2h, 7d." ) );
++            return;
++        }
++
++        String reason = ( args.length > 2 )
++                ? Joiner.on( ' ' ).join( Arrays.copyOfRange( args, 2, args.length ) )
++                : bans.getDefaultReason();
++
++        ProxiedPlayer online = ProxyServer.getInstance().getPlayer( target );
++        String ip = ( online != null ) ? online.getAddress().getAddress().getHostAddress() : null;
++
++        long now = System.currentTimeMillis();
++        BanEntry entry = new BanEntry( target, ip, reason, sender.getName(), now, now + duration );
++        bans.addBan( entry );
++
++        if ( online != null )
++        {
++            online.disconnect( TextComponent.fromLegacy( bans.formatKickMessage( entry ) ) );
++        }
++
++        sender.sendMessage( new TextComponent( ChatColor.GREEN + "Temporarily banned " + target + " for "
++                + BanManager.formatDuration( duration ) + ". Reason: " + ChatColor.WHITE + reason ) );
++    }
++
++    @Override
++    public Iterable<String> onTabComplete(CommandSender sender, String[] args)
++    {
++        if ( args.length == 1 )
++        {
++            Set<String> matches = new HashSet<>();
++            String search = args[0].toLowerCase( Locale.ROOT );
++            for ( ProxiedPlayer player : ProxyServer.getInstance().getPlayers() )
++            {
++                if ( player.getName().toLowerCase( Locale.ROOT ).startsWith( search ) )
++                {
++                    matches.add( player.getName() );
++                }
++            }
++            return matches;
++        }
++        return ImmutableSet.of();
++    }
++}
+diff --git a/module/cmd-ban/src/main/java/net/md_5/bungee/module/cmd/ban/CommandUnban.java b/module/cmd-ban/src/main/java/net/md_5/bungee/module/cmd/ban/CommandUnban.java
+new file mode 100644
+index 00000000..442fcbeb
+--- /dev/null
++++ b/module/cmd-ban/src/main/java/net/md_5/bungee/module/cmd/ban/CommandUnban.java
+@@ -0,0 +1,45 @@
++package net.md_5.bungee.module.cmd.ban;
++
++import com.google.common.collect.ImmutableSet;
++import net.md_5.bungee.api.ChatColor;
++import net.md_5.bungee.api.CommandSender;
++import net.md_5.bungee.api.chat.TextComponent;
++import net.md_5.bungee.api.plugin.Command;
++import net.md_5.bungee.api.plugin.TabExecutor;
++
++public class CommandUnban extends Command implements TabExecutor
++{
++
++    private final BanManager bans;
++
++    public CommandUnban(BanManager bans)
++    {
++        super( "gunban", "bungeecord.command.unban" );
++        this.bans = bans;
++    }
++
++    @Override
++    public void execute(CommandSender sender, String[] args)
++    {
++        if ( args.length == 0 )
++        {
++            sender.sendMessage( new TextComponent( ChatColor.RED + "Usage: /gunban <player|ip>" ) );
++            return;
++        }
++
++        BanEntry removed = bans.removeTarget( args[0] );
++        if ( removed == null )
++        {
++            sender.sendMessage( new TextComponent( ChatColor.RED + args[0] + " is not banned." ) );
++            return;
++        }
++
++        sender.sendMessage( new TextComponent( ChatColor.GREEN + "Unbanned " + args[0] + "." ) );
++    }
++
++    @Override
++    public Iterable<String> onTabComplete(CommandSender sender, String[] args)
++    {
++        return ImmutableSet.of();
++    }
++}
+diff --git a/module/cmd-ban/src/main/java/net/md_5/bungee/module/cmd/ban/PluginBan.java b/module/cmd-ban/src/main/java/net/md_5/bungee/module/cmd/ban/PluginBan.java
+new file mode 100644
+index 00000000..5a7eab6c
+--- /dev/null
++++ b/module/cmd-ban/src/main/java/net/md_5/bungee/module/cmd/ban/PluginBan.java
+@@ -0,0 +1,18 @@
++package net.md_5.bungee.module.cmd.ban;
++
++import net.md_5.bungee.api.plugin.Plugin;
++
++public class PluginBan extends Plugin
++{
++
++    @Override
++    public void onEnable()
++    {
++        BanManager bans = new BanManager( this );
++        getProxy().getPluginManager().registerCommand( this, new CommandBan( bans ) );
++        getProxy().getPluginManager().registerCommand( this, new CommandTempBan( bans ) );
++        getProxy().getPluginManager().registerCommand( this, new CommandUnban( bans ) );
++        getProxy().getPluginManager().registerCommand( this, new CommandBanList( bans ) );
++        getProxy().getPluginManager().registerListener( this, new BanListener( bans ) );
++    }
++}
+diff --git a/module/cmd-ban/src/main/resources/config.yml b/module/cmd-ban/src/main/resources/config.yml
+new file mode 100644
+index 00000000..06f5c287
+--- /dev/null
++++ b/module/cmd-ban/src/main/resources/config.yml
+@@ -0,0 +1,13 @@
++# Configuration for the ban commands (gban, gtempban, gunban, gbanlist).
++# Colour codes using & are supported, and \n inserts a new line.
++# The following placeholders are replaced in the kick messages:
++#   {reason}  - the ban reason
++#   {expiry}  - remaining time for temporary bans
++#   {source}  - who issued the ban
++messages:
++  # Default reason used when a ban is issued without one.
++  default-reason: 'Banned by an operator.'
++  # Shown to a permanently banned player when they are denied entry.
++  permanent: '&cYou are banned from this network.\n&7Reason: &f{reason}'
++  # Shown to a temporarily banned player when they are denied entry.
++  temporary: '&cYou are temporarily banned from this network.\n&7Reason: &f{reason}\n&7Expires in: &f{expiry}'
+diff --git a/module/cmd-ban/src/main/resources/plugin.yml b/module/cmd-ban/src/main/resources/plugin.yml
+new file mode 100644
+index 00000000..24a8e5a5
+--- /dev/null
++++ b/module/cmd-ban/src/main/resources/plugin.yml
+@@ -0,0 +1,5 @@
++name: ${project.name}
++main: net.md_5.bungee.module.cmd.ban.PluginBan
++version: ${describe}
++description: ${project.description}
++author: ${module.author}
+diff --git a/module/pom.xml b/module/pom.xml
+index 279ef27a..8662123f 100644
+--- a/module/pom.xml
++++ b/module/pom.xml
+@@ -20,6 +20,7 @@
+ 
+     <modules>
+         <module>cmd-alert</module>
++        <module>cmd-ban</module>
+         <module>cmd-find</module>
+         <module>cmd-kick</module>
+         <module>cmd-list</module>
+diff --git a/proxy/src/main/java/net/md_5/bungee/module/ModuleManager.java b/proxy/src/main/java/net/md_5/bungee/module/ModuleManager.java
+index a202fad8..8ecdfc0c 100644
+--- a/proxy/src/main/java/net/md_5/bungee/module/ModuleManager.java
++++ b/proxy/src/main/java/net/md_5/bungee/module/ModuleManager.java
+@@ -26,7 +26,7 @@ public class ModuleManager
+     // Command modules shipped inside the proxy jar (see BundledModuleSource).
+     private static final String[] BUNDLED_MODULES =
+     {
+-        "cmd_alert", "cmd_find", "cmd_list", "cmd_send", "cmd_server", "cmd_kick"
++        "cmd_alert", "cmd_find", "cmd_list", "cmd_send", "cmd_server", "cmd_kick", "cmd_ban"
+     };
+ 
+     private final Map<String, ModuleSource> knownSources = new HashMap<>();
+@@ -101,9 +101,16 @@ public class ModuleManager
+                         defaults.add( "bundled://" + name );
+                     }
+                 }
++            case 3:
++                // Add the bundled ban commands for configs already migrated above.
++                defaults.remove( "jenkins://cmd_ban" );
++                if ( !defaults.contains( "bundled://cmd_ban" ) )
++                {
++                    defaults.add( "bundled://cmd_ban" );
++                }
+         }
+         config.put( "modules", defaults );
+-        config.put( "version", 3 );
++        config.put( "version", 4 );
+ 
+         try ( FileWriter wr = new FileWriter( configFile ) )
+         {
+-- 
+2.50.1 (Apple Git-155)
+

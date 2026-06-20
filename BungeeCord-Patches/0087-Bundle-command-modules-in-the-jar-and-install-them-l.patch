@@ -1,0 +1,304 @@
+From 3c5d9ab03458db8af275d9448d20739a186fbf0a Mon Sep 17 00:00:00 2001
+From: regksem <regksem@tuta.io>
+Date: Sat, 20 Jun 2026 13:55:34 +0300
+Subject: [PATCH] Bundle command modules in the jar and install them locally
+
+The proxy fetched its command modules (cmd_alert/find/list/send/server/kick)
+over the network at startup, which fails on offline and custom builds where the
+remote artifact repository no longer serves a matching build, leaving the proxy
+with no /server, /glist, /send, /find or /gkick commands.
+
+Ship the compiled module jars inside the proxy jar under bundled-modules/ and add
+a BundledModuleSource that installs them into modules/ by content, independent of
+the (possibly undetectable) proxy version. modules.yml is migrated to version 3,
+replacing the jenkins:// entries for these modules with bundled://.
+
+diff --git a/bootstrap/pom.xml b/bootstrap/pom.xml
+index 3f483de6..1a948fec 100644
+--- a/bootstrap/pom.xml
++++ b/bootstrap/pom.xml
+@@ -33,11 +33,117 @@
+             <version>${project.version}</version>
+             <scope>compile</scope>
+         </dependency>
++        <!--
++            Command modules are bundled inside the jar (see the dependency-plugin
++            copy below) so they install without a network fetch. They are declared
++            'provided' so the shade plugin does not unpack their classes onto the
++            proxy classpath - each module is loaded from its own plugin classloader.
++            The dependency edge also forces them to build before this module.
++        -->
++        <dependency>
++            <groupId>io.github.waterfallmc</groupId>
++            <artifactId>waterfall-module-cmd-alert</artifactId>
++            <version>${project.version}</version>
++            <scope>provided</scope>
++        </dependency>
++        <dependency>
++            <groupId>io.github.waterfallmc</groupId>
++            <artifactId>waterfall-module-cmd-find</artifactId>
++            <version>${project.version}</version>
++            <scope>provided</scope>
++        </dependency>
++        <dependency>
++            <groupId>io.github.waterfallmc</groupId>
++            <artifactId>waterfall-module-cmd-kick</artifactId>
++            <version>${project.version}</version>
++            <scope>provided</scope>
++        </dependency>
++        <dependency>
++            <groupId>io.github.waterfallmc</groupId>
++            <artifactId>waterfall-module-cmd-list</artifactId>
++            <version>${project.version}</version>
++            <scope>provided</scope>
++        </dependency>
++        <dependency>
++            <groupId>io.github.waterfallmc</groupId>
++            <artifactId>waterfall-module-cmd-send</artifactId>
++            <version>${project.version}</version>
++            <scope>provided</scope>
++        </dependency>
++        <dependency>
++            <groupId>io.github.waterfallmc</groupId>
++            <artifactId>waterfall-module-cmd-server</artifactId>
++            <version>${project.version}</version>
++            <scope>provided</scope>
++        </dependency>
+     </dependencies>
+ 
+     <build>
+         <finalName>XWaterfall</finalName>
+         <plugins>
++            <plugin>
++                <groupId>org.apache.maven.plugins</groupId>
++                <artifactId>maven-dependency-plugin</artifactId>
++                <version>3.8.1</version>
++                <executions>
++                    <execution>
++                        <id>bundle-command-modules</id>
++                        <phase>prepare-package</phase>
++                        <goals>
++                            <goal>copy</goal>
++                        </goals>
++                        <configuration>
++                            <outputDirectory>${project.build.outputDirectory}/bundled-modules</outputDirectory>
++                            <overWriteReleases>true</overWriteReleases>
++                            <overWriteSnapshots>true</overWriteSnapshots>
++                            <artifactItems>
++                                <artifactItem>
++                                    <groupId>io.github.waterfallmc</groupId>
++                                    <artifactId>waterfall-module-cmd-alert</artifactId>
++                                    <version>${project.version}</version>
++                                    <type>jar</type>
++                                    <destFileName>cmd_alert.jar</destFileName>
++                                </artifactItem>
++                                <artifactItem>
++                                    <groupId>io.github.waterfallmc</groupId>
++                                    <artifactId>waterfall-module-cmd-find</artifactId>
++                                    <version>${project.version}</version>
++                                    <type>jar</type>
++                                    <destFileName>cmd_find.jar</destFileName>
++                                </artifactItem>
++                                <artifactItem>
++                                    <groupId>io.github.waterfallmc</groupId>
++                                    <artifactId>waterfall-module-cmd-kick</artifactId>
++                                    <version>${project.version}</version>
++                                    <type>jar</type>
++                                    <destFileName>cmd_kick.jar</destFileName>
++                                </artifactItem>
++                                <artifactItem>
++                                    <groupId>io.github.waterfallmc</groupId>
++                                    <artifactId>waterfall-module-cmd-list</artifactId>
++                                    <version>${project.version}</version>
++                                    <type>jar</type>
++                                    <destFileName>cmd_list.jar</destFileName>
++                                </artifactItem>
++                                <artifactItem>
++                                    <groupId>io.github.waterfallmc</groupId>
++                                    <artifactId>waterfall-module-cmd-send</artifactId>
++                                    <version>${project.version}</version>
++                                    <type>jar</type>
++                                    <destFileName>cmd_send.jar</destFileName>
++                                </artifactItem>
++                                <artifactItem>
++                                    <groupId>io.github.waterfallmc</groupId>
++                                    <artifactId>waterfall-module-cmd-server</artifactId>
++                                    <version>${project.version}</version>
++                                    <type>jar</type>
++                                    <destFileName>cmd_server.jar</destFileName>
++                                </artifactItem>
++                            </artifactItems>
++                        </configuration>
++                    </execution>
++                </executions>
++            </plugin>
+             <plugin>
+                 <groupId>org.apache.maven.plugins</groupId>
+                 <artifactId>maven-jar-plugin</artifactId>
+diff --git a/proxy/src/main/java/net/md_5/bungee/module/BundledModuleSource.java b/proxy/src/main/java/net/md_5/bungee/module/BundledModuleSource.java
+new file mode 100644
+index 00000000..b3485efe
+--- /dev/null
++++ b/proxy/src/main/java/net/md_5/bungee/module/BundledModuleSource.java
+@@ -0,0 +1,69 @@
++package net.md_5.bungee.module;
++
++import com.google.common.io.ByteStreams;
++import com.google.common.io.Files;
++import java.io.IOException;
++import java.io.InputStream;
++import java.util.Arrays;
++import net.md_5.bungee.Util;
++import net.md_5.bungee.api.ProxyServer;
++
++/**
++ * Installs modules that are shipped inside the proxy jar itself, under the
++ * {@code bundled-modules/} resource directory, instead of downloading them over
++ * the network. This keeps the standard command modules working on offline and
++ * custom builds, where the remote artifact repository no longer serves a
++ * matching build.
++ */
++class BundledModuleSource implements ModuleSource
++{
++
++    private static String resourcePath(ModuleSpec module)
++    {
++        return "/bundled-modules/" + module.getName() + ".jar";
++    }
++
++    /**
++     * Whether the on-disk module file is missing or differs from the copy
++     * bundled in the jar (e.g. after a proxy upgrade). Returns {@code false}
++     * when no bundled copy exists, leaving any existing file untouched.
++     */
++    boolean needsUpdate(ModuleSpec module)
++    {
++        if ( !module.getFile().exists() )
++        {
++            return true;
++        }
++        try ( InputStream in = BundledModuleSource.class.getResourceAsStream( resourcePath( module ) ) )
++        {
++            if ( in == null )
++            {
++                return false;
++            }
++            byte[] bundled = ByteStreams.toByteArray( in );
++            byte[] current = Files.toByteArray( module.getFile() );
++            return !Arrays.equals( bundled, current );
++        } catch ( IOException ex )
++        {
++            return true;
++        }
++    }
++
++    @Override
++    public void retrieve(ModuleSpec module, ModuleVersion version)
++    {
++        try ( InputStream in = BundledModuleSource.class.getResourceAsStream( resourcePath( module ) ) )
++        {
++            if ( in == null )
++            {
++                ProxyServer.getInstance().getLogger().warning( "No bundled module available for " + module.getName() + " (" + resourcePath( module ) + ")" );
++                return;
++            }
++            Files.write( ByteStreams.toByteArray( in ), module.getFile() );
++            ProxyServer.getInstance().getLogger().info( "Installed bundled module " + module.getName() );
++        } catch ( IOException ex )
++        {
++            ProxyServer.getInstance().getLogger().warning( "Failed to install bundled module " + module.getName() + ": " + Util.exception( ex ) );
++        }
++    }
++}
+diff --git a/proxy/src/main/java/net/md_5/bungee/module/ModuleManager.java b/proxy/src/main/java/net/md_5/bungee/module/ModuleManager.java
+index b6183c6f..a202fad8 100644
+--- a/proxy/src/main/java/net/md_5/bungee/module/ModuleManager.java
++++ b/proxy/src/main/java/net/md_5/bungee/module/ModuleManager.java
+@@ -23,11 +23,18 @@ import org.yaml.snakeyaml.Yaml;
+ public class ModuleManager
+ {
+ 
++    // Command modules shipped inside the proxy jar (see BundledModuleSource).
++    private static final String[] BUNDLED_MODULES =
++    {
++        "cmd_alert", "cmd_find", "cmd_list", "cmd_send", "cmd_server", "cmd_kick"
++    };
++
+     private final Map<String, ModuleSource> knownSources = new HashMap<>();
+ 
+     public ModuleManager()
+     {
+         knownSources.put( "jenkins", new JenkinsModuleSource() );
++        knownSources.put( "bundled", new BundledModuleSource() );
+     }
+ 
+     public void load(ProxyServer proxy, File moduleDirectory) throws Exception
+@@ -37,8 +44,9 @@ public class ModuleManager
+         ModuleVersion bungeeVersion = ModuleVersion.parse( proxy.getVersion() );
+         if ( bungeeVersion == null )
+         {
+-            proxy.getLogger().warning( "Couldn't detect bungee version. Custom build?" );
+-            return;
++            // Custom or local build: versioned remote modules cannot be fetched,
++            // but modules bundled inside the jar are still installed below.
++            proxy.getLogger().warning( "Couldn't detect proxy version (custom build?); remote modules will be skipped." );
+         }
+ 
+         List<ModuleSpec> modules = new ArrayList<>();
+@@ -82,9 +90,20 @@ public class ModuleManager
+                 defaults.add( "jenkins://cmd_server" );
+             case 1:
+                 defaults.add( "jenkins://reconnect_yaml" );
++            case 2:
++                // XWaterfall: ship the command modules inside the jar instead of
++                // downloading them, so they work on offline and custom builds.
++                for ( String name : BUNDLED_MODULES )
++                {
++                    defaults.remove( "jenkins://" + name );
++                    if ( !defaults.contains( "bundled://" + name ) )
++                    {
++                        defaults.add( "bundled://" + name );
++                    }
++                }
+         }
+         config.put( "modules", defaults );
+-        config.put( "version", 2 );
++        config.put( "version", 3 );
+ 
+         try ( FileWriter wr = new FileWriter( configFile ) )
+         {
+@@ -115,12 +134,30 @@ public class ModuleManager
+ 
+         for ( ModuleSpec module : modules )
+         {
++            ModuleSource provider = module.getProvider();
++
++            // Modules bundled in the jar are installed by content, independent of
++            // the (possibly undetectable) proxy version.
++            if ( provider instanceof BundledModuleSource )
++            {
++                if ( ( (BundledModuleSource) provider ).needsUpdate( module ) )
++                {
++                    provider.retrieve( module, bungeeVersion );
++                }
++                continue;
++            }
++
++            if ( bungeeVersion == null )
++            {
++                continue;
++            }
++
+             ModuleVersion moduleVersion = ( module.getFile().exists() ) ? getVersion( module.getFile() ) : null;
+ 
+             if ( !bungeeVersion.equals( moduleVersion ) )
+             {
+                 proxy.getLogger().info( "Attempting to update plugin from " + moduleVersion + " to " + bungeeVersion );
+-                module.getProvider().retrieve( module, bungeeVersion );
++                provider.retrieve( module, bungeeVersion );
+             }
+         }
+     }
+-- 
+2.50.1 (Apple Git-155)
+
