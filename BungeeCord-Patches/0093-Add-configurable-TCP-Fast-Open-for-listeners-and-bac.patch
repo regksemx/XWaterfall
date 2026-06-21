@@ -1,0 +1,147 @@
+From 2df6c607906ca3ac109a67acbd7e00aeef5897ba Mon Sep 17 00:00:00 2001
+From: regksem <regksem@tuta.io>
+Date: Sun, 21 Jun 2026 17:02:19 +0300
+Subject: [PATCH] Add configurable TCP Fast Open for listeners and backend
+ connects
+
+Enables TCP Fast Open (TCP_FASTOPEN on the listening socket and
+TCP_FASTOPEN_CONNECT on backend connects) so a connection can carry data
+in the SYN and skip a round-trip of the TCP handshake, cutting
+connection-setup latency and CPU under connection churn (e.g. join
+floods). Gated on the epoll/io_uring transport via the new
+PipelineUtils.isFastOpenSupported() and a network.tcp-fast-open option
+(default on); each setOption is wrapped so an unsupported kernel or
+transport can never break startup or a backend connect.
+
+diff --git a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
+index c57ed094..dd94f37a 100644
+--- a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
++++ b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
+@@ -111,6 +111,9 @@ public class WaterfallConfiguration extends Configuration {
+         // decode path, so it takes effect on the next restart.
+         disableEntityMetadataRewrite = xConfig.getBoolean("network.disable-entity-metadata-rewrite", disableEntityMetadataRewrite);
+         net.md_5.bungee.protocol.MinecraftDecoder.ENTITY_REWRITE_DISABLED = disableEntityMetadataRewrite;
++        // TCP Fast Open. Set on the listening socket at bind and on backend connects,
++        // so it takes effect on the next restart (the listener is bound once at boot).
++        tcpFastOpen = xConfig.getBoolean("network.tcp-fast-open", tcpFastOpen);
+ 
+         // Virtual threads for plugin async tasks. Bound when a plugin first
+         // creates its executor, so changing this requires a restart for already
+diff --git a/proxy/src/main/java/net/md_5/bungee/BungeeCord.java b/proxy/src/main/java/net/md_5/bungee/BungeeCord.java
+index 2996f746..4542883d 100644
+--- a/proxy/src/main/java/net/md_5/bungee/BungeeCord.java
++++ b/proxy/src/main/java/net/md_5/bungee/BungeeCord.java
+@@ -368,14 +368,26 @@ public class BungeeCord extends ProxyServer
+                     }
+                 }
+             };
+-            new ServerBootstrap()
++            // XWaterfall start - TCP Fast Open on the listening socket (epoll/io_uring only)
++            ServerBootstrap serverBootstrap = new ServerBootstrap()
+                     .channelFactory( PipelineUtils.getServerChannelFactory( info.getSocketAddress() ) ) // Waterfall - netty reflection -> factory
+                     .option( ChannelOption.SO_REUSEADDR, true ) // TODO: Move this elsewhere!
+                     .childAttr( PipelineUtils.LISTENER, info )
+                     .childHandler( unsafe().getFrontendChannelInitializer().getChannelInitializer() )
+                     .group( bossEventLoopGroup, workerEventLoopGroup )
+-                    .localAddress( info.getSocketAddress() )
+-                    .bind().addListener( listener );
++                    .localAddress( info.getSocketAddress() );
++            if ( config.isTcpFastOpen() && PipelineUtils.isFastOpenSupported() )
++            {
++                try
++                {
++                    serverBootstrap.option( ChannelOption.TCP_FASTOPEN, 256 );
++                } catch ( RuntimeException ex )
++                {
++                    getLogger().log( Level.FINE, "TCP Fast Open is not available for the listening socket", ex );
++                }
++            }
++            serverBootstrap.bind().addListener( listener );
++            // XWaterfall end
+ 
+             if ( info.isQueryEnabled() )
+             {
+diff --git a/proxy/src/main/java/net/md_5/bungee/UserConnection.java b/proxy/src/main/java/net/md_5/bungee/UserConnection.java
+index dbd50a8a..d196066c 100644
+--- a/proxy/src/main/java/net/md_5/bungee/UserConnection.java
++++ b/proxy/src/main/java/net/md_5/bungee/UserConnection.java
+@@ -457,6 +457,18 @@ public final class UserConnection implements ProxiedPlayer
+                 .handler( bungee.unsafe().getBackendChannelInitializer().getChannelInitializer() )
+                 .option( ChannelOption.CONNECT_TIMEOUT_MILLIS, request.getConnectTimeout() )
+                 .remoteAddress( target.getAddress() );
++        // XWaterfall start - TCP Fast Open connect to the backend (epoll/io_uring only)
++        if ( net.md_5.bungee.BungeeCord.getInstance().config.isTcpFastOpen() && PipelineUtils.isFastOpenSupported() )
++        {
++            try
++            {
++                b.option( ChannelOption.TCP_FASTOPEN_CONNECT, true );
++            } catch ( RuntimeException ex )
++            {
++                // Backend transport / kernel does not support TFO connect; fall back silently.
++            }
++        }
++        // XWaterfall end
+         // Windows is bugged, multi homed users will just have to live with random connecting IPs
+         if ( getPendingConnection().getListener().isSetLocalAddress() && !PlatformDependent.isWindows() && getPendingConnection().getListener().getSocketAddress() instanceof InetSocketAddress )
+         {
+diff --git a/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java b/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
+index db5e94bd..0e10afa5 100644
+--- a/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
++++ b/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
+@@ -160,6 +160,16 @@ public abstract class Configuration implements ProxyConfig
+      */
+     protected int workerThreads = 0;
+     // XWaterfall end
++    // XWaterfall start - TCP Fast Open (loaded from xwaterfall.yml)
++    /**
++     * Enable TCP Fast Open on the listening socket (incoming client connections)
++     * and on backend connects, so a connection can carry data in the SYN and skip
++     * a round-trip of the TCP handshake. Only active on the epoll / io_uring
++     * transports (Linux) with a kernel that permits TFO; a no-op everywhere else.
++     * Enabled by default.
++     */
++    protected boolean tcpFastOpen = true;
++    // XWaterfall end
+     // XWaterfall start - anti-exploit / protocol verification options (loaded from xwaterfall.yml)
+     /**
+      * Inclusive protocol-version ranges that are refused at handshake, e.g.
+diff --git a/proxy/src/main/java/net/md_5/bungee/netty/PipelineUtils.java b/proxy/src/main/java/net/md_5/bungee/netty/PipelineUtils.java
+index 903408c6..d41e6d7f 100644
+--- a/proxy/src/main/java/net/md_5/bungee/netty/PipelineUtils.java
++++ b/proxy/src/main/java/net/md_5/bungee/netty/PipelineUtils.java
+@@ -203,6 +203,13 @@ public class PipelineUtils
+         return new MultiThreadIoEventLoopGroup( threads, factory, io_uring ? IoUringIoHandler.newFactory() : epoll ? EpollIoHandler.newFactory() : NioIoHandler.newFactory() );
+     }
+ 
++    // XWaterfall - whether the active Netty transport supports TCP Fast Open (epoll / io_uring).
++    // The NIO transport (Windows / fallback) does not, so the option must not be set there.
++    public static boolean isFastOpenSupported()
++    {
++        return epoll || io_uring;
++    }
++
+     public static Class<? extends ServerChannel> getServerChannel(SocketAddress address)
+     {
+         if ( address instanceof DomainSocketAddress )
+diff --git a/proxy/src/main/resources/xwaterfall.yml b/proxy/src/main/resources/xwaterfall.yml
+index c0a67b57..6ccaa179 100644
+--- a/proxy/src/main/resources/xwaterfall.yml
++++ b/proxy/src/main/resources/xwaterfall.yml
+@@ -149,6 +149,14 @@ network:
+   # safe. Restart required.
+   disable-entity-metadata-rewrite: false
+ 
++  # TCP Fast Open. Lets a connection carry data in the SYN packet and skip a
++  # round-trip of the TCP handshake, lowering connection-setup latency and CPU
++  # under connection churn (e.g. join floods). Only takes effect on Linux with the
++  # epoll/io_uring transport and a kernel that permits TFO (net.ipv4.tcp_fastopen);
++  # it is a harmless no-op on other systems. Applies to both incoming client
++  # connections and backend connects. Restart required for the listening socket.
++  tcp-fast-open: true
++
+ # ---------------------------------------------------------------------------
+ #  Virtual threads (Java 21+)
+ # ---------------------------------------------------------------------------
+-- 
+2.50.1 (Apple Git-155)
+
