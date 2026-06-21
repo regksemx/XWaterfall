@@ -1,0 +1,92 @@
+From 94e110ae1846e17daf87560c38acee8df90f658c Mon Sep 17 00:00:00 2001
+From: regksem <regksem@tuta.io>
+Date: Sun, 21 Jun 2026 16:56:12 +0300
+Subject: [PATCH] Add network-slice zero-copy clientbound forwarding
+
+When entity-metadata rewriting is disabled there is no handler left that
+mutates a forwarded packet buffer in place, so the decoder can hand each
+packet downstream as a zero-copy retained slice instead of copying it.
+Previously MinecraftDecoder always copied clientbound GAME packets for
+pre-1.20.2 connections (needed by the EntityMap) even when rewriting was
+off.
+
+MinecraftDecoder.shouldCopyBuffer() now skips the copy whenever entity
+rewriting is disabled, driven by a new ENTITY_REWRITE_DISABLED flag that
+WaterfallConfiguration mirrors from disable_entity_metadata_rewrite. The
+option is surfaced in xwaterfall.yml (network.disable-entity-metadata-
+rewrite); the legacy waterfall.yml key stays the default.
+
+diff --git a/protocol/src/main/java/net/md_5/bungee/protocol/MinecraftDecoder.java b/protocol/src/main/java/net/md_5/bungee/protocol/MinecraftDecoder.java
+index 15832a8c..dc5bfba4 100644
+--- a/protocol/src/main/java/net/md_5/bungee/protocol/MinecraftDecoder.java
++++ b/protocol/src/main/java/net/md_5/bungee/protocol/MinecraftDecoder.java
+@@ -127,12 +127,26 @@ public class MinecraftDecoder extends MessageToMessageDecoder<ByteBuf>
+     {
+         // We only use the entity map in game state, we can avoid many buffer copies by checking this
+         // EntityMap is removed for 1.20.2 and up
++        // XWaterfall start - Network Slice: EntityMap is the only handler that mutates the
++        // forwarded packet buffer in place, so when entity-metadata rewriting is disabled we
++        // can hand every packet downstream as a zero-copy retained slice instead of copying it.
++        if ( ENTITY_REWRITE_DISABLED )
++        {
++            return false;
++        }
++        // XWaterfall end
+         return protocol == Protocol.GAME && protocolVersion < ProtocolConstants.MINECRAFT_1_20_2;
+     }
+ 
+     // Waterfall start: Additional DoS mitigations, courtesy of Velocity
+     public static final boolean DEBUG = Boolean.getBoolean("waterfall.packet-decode-logging");
+ 
++    // XWaterfall start - Network Slice: set from WaterfallConfiguration at (re)load to mirror
++    // disable_entity_metadata_rewrite. When true, decoded packets are forwarded as zero-copy
++    // retained slices instead of being copied per packet (see shouldCopyBuffer).
++    public static volatile boolean ENTITY_REWRITE_DISABLED = false;
++    // XWaterfall end
++
+     // Cached Exceptions:
+     private static final CorruptedFrameException PACKET_LENGTH_OVERSIZED =
+             new CorruptedFrameException("A packet could not be decoded because it was too large. For more "
+diff --git a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
+index a92f8914..c57ed094 100644
+--- a/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
++++ b/proxy/src/main/java/io/github/waterfallmc/waterfall/conf/WaterfallConfiguration.java
+@@ -104,6 +104,14 @@ public class WaterfallConfiguration extends Configuration {
+         bossThreads = Math.max(1, xConfig.getInt("network.boss-threads", bossThreads));
+         workerThreads = Math.max(0, xConfig.getInt("network.worker-threads", workerThreads));
+ 
++        // XWaterfall - Network Slice: entity-metadata rewriting may be disabled from
++        // xwaterfall.yml (the legacy waterfall.yml key read above stays the default). When
++        // disabled, the clientbound packet buffer is never mutated in place, so the decoder
++        // forwards a zero-copy retained slice instead of copying every packet. Bound into the
++        // decode path, so it takes effect on the next restart.
++        disableEntityMetadataRewrite = xConfig.getBoolean("network.disable-entity-metadata-rewrite", disableEntityMetadataRewrite);
++        net.md_5.bungee.protocol.MinecraftDecoder.ENTITY_REWRITE_DISABLED = disableEntityMetadataRewrite;
++
+         // Virtual threads for plugin async tasks. Bound when a plugin first
+         // creates its executor, so changing this requires a restart for already
+         // started plugins.
+diff --git a/proxy/src/main/resources/xwaterfall.yml b/proxy/src/main/resources/xwaterfall.yml
+index f159d817..c0a67b57 100644
+--- a/proxy/src/main/resources/xwaterfall.yml
++++ b/proxy/src/main/resources/xwaterfall.yml
+@@ -139,6 +139,16 @@ network:
+   boss-threads: 1
+   worker-threads: 0
+ 
++  # Network Slice (zero-copy packet forwarding). Set to TRUE to disable entity-id
++  # metadata rewriting - the only handler that edits a forwarded packet buffer in
++  # place. With it disabled, the proxy forwards clientbound packets as zero-copy
++  # buffer slices instead of copying every packet, lowering CPU on the forwarding
++  # path. Biggest win with many players on pre-1.20.2 clients (e.g. via ViaVersion);
++  # 1.20.2+ already avoids the copy. Keep FALSE if your setup relies on entity-id
++  # rewriting between backends; for the common one-world-per-backend layout, true is
++  # safe. Restart required.
++  disable-entity-metadata-rewrite: false
++
+ # ---------------------------------------------------------------------------
+ #  Virtual threads (Java 21+)
+ # ---------------------------------------------------------------------------
+-- 
+2.50.1 (Apple Git-155)
+
