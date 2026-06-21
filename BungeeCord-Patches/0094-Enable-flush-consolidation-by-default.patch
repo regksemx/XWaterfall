@@ -1,0 +1,45 @@
+From d923030276801121b7df7b12a771bbabd96d2ec1 Mon Sep 17 00:00:00 2001
+From: regksem <regksem@tuta.io>
+Date: Sun, 21 Jun 2026 17:08:10 +0300
+Subject: [PATCH] Enable flush consolidation by default
+
+Flush consolidation (patch 0073) coalesces Netty flushes into fewer flush
+syscalls, a clear CPU win under load for a tiny, rare latency cost. Make it
+the default so fresh installs benefit out of the box; existing configs keep
+their current value until edited.
+
+diff --git a/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java b/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
+index 0e10afa5..7af3bc7e 100644
+--- a/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
++++ b/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
+@@ -133,10 +133,10 @@ public abstract class Configuration implements ProxyConfig
+     protected int compressionLevel = -1;
+     /**
+      * Coalesce Netty flushes on connection pipelines to avoid expensive flush
+-     * syscalls under load, at the cost of very rare slight latency. Disabled by
++     * syscalls under load, at the cost of very rare slight latency. Enabled by
+      * default.
+      */
+-    protected boolean consolidateFlushes = false;
++    protected boolean consolidateFlushes = true;
+     // XWaterfall end
+     // XWaterfall start - virtual threads for plugin async tasks (loaded from xwaterfall.yml)
+     /**
+diff --git a/proxy/src/main/resources/xwaterfall.yml b/proxy/src/main/resources/xwaterfall.yml
+index 6ccaa179..b1e77a43 100644
+--- a/proxy/src/main/resources/xwaterfall.yml
++++ b/proxy/src/main/resources/xwaterfall.yml
+@@ -122,8 +122,8 @@ compression:
+ # Coalesce Netty flushes on connection pipelines so the proxy issues fewer
+ # expensive flush syscalls under load (e.g. when many players are clustered
+ # together or one player receives a burst of packets). This can noticeably cut
+-# CPU usage at the cost of very rare, slight added latency. Disabled by default.
+-consolidate-flushes: false
++# CPU usage at the cost of very rare, slight added latency. Enabled by default.
++consolidate-flushes: true
+ 
+ # ---------------------------------------------------------------------------
+ #  Network event-loop threads
+-- 
+2.50.1 (Apple Git-155)
+
