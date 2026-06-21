@@ -1,0 +1,54 @@
+From ceac826e93c94a3bff94f5b968fb6f142c0f0eaa Mon Sep 17 00:00:00 2001
+From: regksem <regksem@tuta.io>
+Date: Sun, 21 Jun 2026 17:17:21 +0300
+Subject: [PATCH] Default the network compression level to 1 to favour CPU
+
+Compression is one of the largest CPU costs under load. The deflate level
+is the single biggest lever: level 1 roughly halves compression CPU versus
+the zlib default (~6) for only a modest increase in outbound bandwidth.
+Default compression.network.level to 1; it stays fully configurable and
+the output remains a standard, wire-compatible zlib stream.
+
+diff --git a/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java b/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
+index 7af3bc7e..5edfde13 100644
+--- a/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
++++ b/proxy/src/main/java/net/md_5/bungee/conf/Configuration.java
+@@ -128,9 +128,11 @@ public abstract class Configuration implements ProxyConfig
+     protected String compressionType = "ZLIB";
+     /**
+      * Deflate level (1-9) applied to outgoing compressed packets, or -1 for the
+-     * zlib default. Closer to 9 means smaller packets at a higher CPU cost.
++     * zlib default (~6). Lower means less CPU spent compressing at the cost of
++     * slightly larger packets; 1 is the cheapest. Defaults to 1 to favour CPU,
++     * since compression is one of the largest CPU costs under load.
+      */
+-    protected int compressionLevel = -1;
++    protected int compressionLevel = 1;
+     /**
+      * Coalesce Netty flushes on connection pipelines to avoid expensive flush
+      * syscalls under load, at the cost of very rare slight latency. Enabled by
+diff --git a/proxy/src/main/resources/xwaterfall.yml b/proxy/src/main/resources/xwaterfall.yml
+index b1e77a43..5de31f2a 100644
+--- a/proxy/src/main/resources/xwaterfall.yml
++++ b/proxy/src/main/resources/xwaterfall.yml
+@@ -110,11 +110,15 @@ motd:
+ # CPU trade-off and stays wire-compatible with vanilla clients/servers.
+ #
+ # Level: 1-9 (closer to 9 = smaller packets, more CPU), or -1 for the zlib
+-# default. Out-of-range values are clamped into 1-9.
++# default (~6). Out-of-range values are clamped into 1-9. Compression is one of
++# the largest CPU costs under load, so a low level is the single biggest CPU
++# lever here: level 1 roughly halves compression CPU versus the default for only
++# a modest (~15-25%) increase in outbound bandwidth. Defaults to 1 to favour CPU;
++# raise it toward 6-9 if outbound bandwidth matters more to you than CPU.
+ compression:
+   network:
+     type: "ZLIB"
+-    level: -1
++    level: 1
+ 
+ # ---------------------------------------------------------------------------
+ #  Flush consolidation
+-- 
+2.50.1 (Apple Git-155)
+
